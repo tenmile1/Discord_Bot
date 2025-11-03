@@ -1,6 +1,6 @@
 // index.js
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, REST, Routes, PermissionsBitField } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, REST, Routes, PermissionsBitField, ChannelType } = require('discord.js');
 const Database = require('better-sqlite3');
 const cron = require('cron');
 const path = require('path');
@@ -77,6 +77,11 @@ const commands = [
       { name: 'exclude_role', description: 'Exclude anyone with this role.', type: 8, required: false }
     ]
   },
+{
+  name: 'debug-channel',
+  description: 'Inspect a channel: type, isTextBased, permissions.',
+  options: [{ name: 'channel', description: 'Channel to inspect', type: 7, required: true }]
+},
   {
     name: 'inactive-kick',
     description: 'Kick members who have been inactive for N days (requires confirm).',
@@ -272,7 +277,27 @@ client.on('interactionCreate', async (interaction) => {
       );
       return;
     }
-
+if (interaction.commandName === 'debug-channel') {
+  const ch = interaction.options.getChannel('channel');
+  const me = interaction.guild.members.me;
+  const perms = ch.permissionsFor?.(me) ?? new PermissionsBitField(0);
+  const canView = perms.has(PermissionsBitField.Flags.ViewChannel);
+  const canReadHist = perms.has(PermissionsBitField.Flags.ReadMessageHistory);
+  const canSend = perms.has(PermissionsBitField.Flags.SendMessages);
+  const isTextBased = ch.isTextBased?.() ? 'yes' : 'no';
+  await interaction.reply({
+    content:
+      `Channel: ${ch} (id: ${ch.id})\n` +
+      `type: ${ch.type}\n` +
+      `isTextBased(): ${isTextBased}\n` +
+      `viewable: ${ch.viewable ? 'yes' : 'no'}\n` +
+      `perms(ViewChannel): ${canView}\n` +
+      `perms(ReadMessageHistory): ${canReadHist}\n` +
+      `perms(SendMessages): ${canSend}`,
+    ephemeral: true
+  });
+  return;
+}
     // /inactive-kick
     if (interaction.commandName === 'inactive-kick') {
       const confirm = (interaction.options.getString('confirm') || '').toLowerCase().trim();
