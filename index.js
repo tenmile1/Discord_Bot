@@ -224,13 +224,15 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
 
       const list = await scanInactive(guild, days, minVcMinutes, excludeRole?.id ?? null);
-      const preview = list.slice(0, MAX_SCAN_LIST).map(u => `• <@${u.id}> (${u.tag})`).join('\n') || '_None_';
-      const more = list.length > MAX_SCAN_LIST ? `\n…and **${list.length - MAX_SCAN_LIST}** more.` : '';
+      let preview = list.slice(0, 50).map(u => `<@${u.id}>`).join(', ');
+let more = list.length > 50 ? ` + ${list.length - 50} more` : '';
 
-      await interaction.editReply(
-        `**Inactive scan results** (no messages & no VC in last **${days}** days; VC minutes threshold: **${minVcMinutes}**; excluded role: **${excludeRole ? excludeRole.name : 'none'}**)` +
-        `\nTotal: **${list.length}**\n${preview}${more}\n\nRun **/inactive-kick** with the same filters to remove them (requires confirm).`
-      );
+await interaction.editReply(
+  `Inactive users: ${list.length} total.\n` +
+  `Sample: ${preview}${more}\n\n` +
+  `Run /inactive-kick confirm:true to kick them.`
+);
+
     }
 
     if (interaction.commandName === 'inactive-kick') {
