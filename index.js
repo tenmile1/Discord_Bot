@@ -382,36 +382,48 @@ const baseChannels = targetChannel
       }
 
       async function scanChannel(channel){
-        channelsScanned++;
-        let scannedHere = 0;
-        let beforeId = undefined;
+  channelsScanned++;
 
-if (!channel.messages?.fetch) return; // skip channels without message API
+  // skip channels without a messages API (some voice channels without text)
+  if (!channel || !channel.messages || !channel.messages.fetch) return;
 
   let scannedHere = 0;
   let beforeId = undefined;
 
-        while (scannedHere < perChannelLimit) {
-          const left = perChannelLimit - scannedHere;
-          const batch = await channel.messages.fetch({ limit: Math.min(100, left), before: beforeId }).catch(() => null);
-          if (!batch || batch.size === 0) break;
+  while (scannedHere < perChannelLimit) {
+    const left = perChannelLimit - scannedHere;
 
-          for (const [, m] of batch) {
-            scannedHere++; messagesScanned++;
-            if (!m.author?.bot && m.createdTimestamp >= cutoff) {
-              upsertMessage.run({ guild_id: interaction.guild.id, user_id: m.author.id, ts: m.createdTimestamp });
-              usersTouched++;
-            }
-          }
+    let batch;
+    try {
+      batch = await channel.messages.fetch({ limit: Math.min(100, left), before: beforeId });
+    } catch {
+      break; // cannot fetch this channel's messages
+    }
+    if (!batch || batch.size === 0) break;
 
-          const last = batch.last();
-          beforeId = last?.id;
-          const oldestTs = batch.last()?.createdTimestamp ?? 0;
-          if (oldestTs < cutoff) break;
-
-          await sleep(350);
-        }
+    for (const [, m] of batch) {
+      scannedHere++;
+      messagesScanned++;
+      if (!m.author?.bot && m.createdTimestamp >= cutoff) {
+        upsertMessage.run({
+          guild_id: interaction.guild.id,
+          user_id: m.author.id,
+          ts: m.createdTimestamp
+        });
+        usersTouched++;
       }
+    }
+
+    const last = batch.last();
+    beforeId = last?.id;
+
+    const oldestTs = batch.last()?.createdTimestamp ?? 0;
+    if (oldestTs < cutoff) break;
+
+    await sleep(350); // gentle rate-limit backoff
+  }
+}
+
 
       for (const ch of channelsToScan) {
         try { await scanChannel(ch); } catch {/* skip */}
