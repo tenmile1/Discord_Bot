@@ -78,6 +78,14 @@ const commands = [
     ]
   },
 {
+  name: 'peek-channel',
+  description: 'Show the last few messages in a channel (for debugging).',
+  options: [
+    { name: 'channel', description: 'Channel to inspect', type: 7, required: true },
+    { name: 'limit', description: 'How many messages (default 10, max 25).', type: 4, required: false }
+  ]
+},
+{
   name: 'debug-channel',
   description: 'Inspect a channel: type, isTextBased, permissions.',
   options: [{ name: 'channel', description: 'Channel to inspect', type: 7, required: true }]
@@ -294,6 +302,45 @@ if (interaction.commandName === 'debug-channel') {
       `perms(ViewChannel): ${canView}\n` +
       `perms(ReadMessageHistory): ${canReadHist}\n` +
       `perms(SendMessages): ${canSend}`,
+    ephemeral: true
+  });
+  return;
+}
+if (interaction.commandName === 'peek-channel') {
+  const ch = interaction.options.getChannel('channel');
+  const lim = Math.min(Math.max(interaction.options.getInteger('limit') ?? 10, 1), 25);
+
+  const me = interaction.guild.members.me;
+  const perms = ch.permissionsFor?.(me);
+  const canView = !!perms && perms.has(PermissionsBitField.Flags.ViewChannel);
+  const canRead = !!perms && perms.has(PermissionsBitField.Flags.ReadMessageHistory);
+
+  if (!canView || !canRead || !ch.messages?.fetch) {
+    return interaction.reply({ content: 'I cannot read messages in that channel.', ephemeral: true });
+  }
+
+  let batch;
+  try {
+    batch = await ch.messages.fetch({ limit: lim });
+  } catch (e) {
+    return interaction.reply({ content: `Fetch failed: ${e.message}`, ephemeral: true });
+  }
+  if (!batch || batch.size === 0) {
+    return interaction.reply({ content: 'No messages returned.', ephemeral: true });
+  }
+
+  const lines = [];
+  let i = 0;
+  for (const [, m] of batch) {
+    if (i++ >= lim) break;
+    const when = new Date(m.createdTimestamp).toISOString();
+    const who = m.author?.bot ? `(bot) ${m.author.tag}` : m.author?.tag;
+    const text = (m.content || '[embed/attachment]').slice(0, 60).replace(/\n/g, ' ');
+    lines.push(`• ${when} — ${who}: ${text}`);
+  }
+
+  await interaction.reply({
+    content: `Last ${lines.length} messages in ${ch}:\n` + lines.join('\n'),
     ephemeral: true
   });
   return;
