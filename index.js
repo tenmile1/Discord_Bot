@@ -98,6 +98,15 @@ const commands = [
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
+  // 1) Clear GLOBAL commands to remove duplicates everywhere
+  await rest.put(
+    Routes.applicationCommands(process.env.CLIENT_ID),
+    { body: [] }
+  );
+  console.log('✓ Cleared global commands');
+
+  // 2) Register GUILD commands (instant in your server)
   if (process.env.GUILD_ID) {
     await rest.put(
       Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
@@ -105,6 +114,7 @@ async function registerCommands() {
     );
     console.log(`✓ Slash commands registered (guild: ${process.env.GUILD_ID})`);
   } else {
+    // (fallback) If no GUILD_ID set, you can register globally instead
     await rest.put(
       Routes.applicationCommands(process.env.CLIENT_ID),
       { body: commands }
