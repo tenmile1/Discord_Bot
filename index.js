@@ -343,9 +343,26 @@ if (interaction.commandName === 'debug-channel') {
       let channelsScanned = 0, messagesScanned = 0, usersTouched = 0;
       function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-      const baseChannels = targetChannel
-        ? [targetChannel]
-        : interaction.guild.channels.cache.filter(c => c?.isTextBased?.() && c.viewable).map(c => c);
+      const me = interaction.guild.members.me;
+
+function canScan(ch) {
+  // Allow classic text & announcement channels, threads, forums…
+  // AND allow voice channels (for Text-in-Voice) as long as we can read history.
+  const isEligibleType =
+    ch?.isTextBased?.() ||
+    ch?.type === ChannelType.GuildVoice;
+
+  const perms = ch.permissionsFor?.(me);
+  const canView = !!perms && perms.has(PermissionsBitField.Flags.ViewChannel);
+  const canRead = !!perms && perms.has(PermissionsBitField.Flags.ReadMessageHistory);
+
+  return !!ch && isEligibleType && ch.viewable && canView && canRead;
+}
+
+const baseChannels = targetChannel
+  ? [targetChannel]
+  : interaction.guild.channels.cache.filter(canScan).map(c => c);
+=> c);
 
       async function addActiveThreadsOf(channel, arr){
         try {
