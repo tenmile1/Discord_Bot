@@ -372,7 +372,7 @@ if (interaction.commandName === 'hydrate-history') {
     try { await scanChannel(ch); } catch { /* skip problematic channel */ }
   }
 
-  await interaction.followUp({
+    await interaction.followUp({
     content:
       `Hydrate complete.\n` +
       `• Channels scanned: ${channelsScanned}\n` +
@@ -381,6 +381,8 @@ if (interaction.commandName === 'hydrate-history') {
       (targetChannel ? `• Channel: ${targetChannel}` : ''),
     ephemeral: true
   });
+}   // end hydrate-history IF block
+}); // end client.on('interactionCreate', ...) handler
 
 // Optional: daily dry-run log at 04:00
 new cron.CronJob('0 4 * * *', async () => {
