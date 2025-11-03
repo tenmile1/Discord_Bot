@@ -361,7 +361,6 @@ function canScan(ch) {
 const baseChannels = targetChannel
   ? [targetChannel]
   : Array.from(interaction.guild.channels.cache.values()).filter(canScan);
-=> c);
 
       async function addActiveThreadsOf(channel, arr){
         try {
