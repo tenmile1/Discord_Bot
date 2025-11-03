@@ -86,6 +86,14 @@ const commands = [
       { name: 'exclude_role', description: 'Exclude anyone with this role.', type: 8, required: false }
     ]
   }
+{
+  name: 'hydrate-history',
+  description: 'One-time backfill: scan recent messages and update last_message_at.',
+  options: [
+    { name: 'days', description: 'How many days back (default 90).', type: 4, required: false },
+    { name: 'per_channel_limit', description: 'Max messages per channel to scan (default 500).', type: 4, required: false }
+  ]
+}
 ];
 
 async function registerCommands() {
@@ -123,7 +131,7 @@ function isInactiveByThreshold(row, cutoffMs, minVcSeconds) {
   const lv = row.last_vc_at ?? 0;
   const hasRecentMessage = lm >= cutoffMs;
   const hasRecentVC = lv >= cutoffMs;
-  const vcEnough = (row.vc_seconds_total || 0) >= minVcSeconds;
+  const vcEnough = (minVcSeconds > 0) && ((row.vc_seconds_total || 0) >= minVcSeconds);
   return !hasRecentMessage && !hasRecentVC && !vcEnough;
 }
 
@@ -261,6 +269,79 @@ await interaction.editReply(
       await interaction.reply({ content: 'Something went wrong. Check bot permissions and try again.', ephemeral: true });
     }
   }
+if (interaction.commandName === 'hydrate-history') {
+  // Only trusted users should run this once
+  if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild)) {
+    return interaction.reply({ content: 'You need **Manage Server** to run this.', ephemeral: true });
+  }
+
+  const days = interaction.options.getInteger('days') ?? 90;
+  const perChannelLimitRaw = interaction.options.getInteger('per_channel_limit');
+  // clamp between 50 and 2000 to be safe with rate limits
+  const perChannelLimit = Math.min(Math.max(perChannelLimitRaw ?? 500, 50), 2000);
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+
+  await interaction.reply({ content: `Starting hydrate (≤${days} days, up to ${perChannelLimit} msgs/channel)…`, ephemeral: true });
+
+  let channelsScanned = 0;
+  let messagesScanned = 0;
+  let usersTouched = 0;
+
+  // Get all text-based channels the bot can read
+  const textChannels = interaction.guild.channels.cache.filter((c) => {
+    try {
+      return c?.isTextBased?.() && c.viewable; // viewable respects permissions
+    } catch {
+      return false;
+    }
+  });
+
+  for (const [, channel] of textChannels) {
+    channelsScanned++;
+    let scannedHere = 0;
+    let beforeId = undefined;
+
+    try {
+      while (scannedHere < perChannelLimit) {
+        const left = perChannelLimit - scannedHere;
+        const batch = await channel.messages.fetch({ limit: Math.min(100, left), before: beforeId }).catch(() => null);
+        if (!batch || batch.size === 0) break;
+
+        for (const [, m] of batch) {
+          scannedHere++;
+          messagesScanned++;
+          if (!m.author?.bot && m.createdTimestamp >= cutoff) {
+            // Update last_message_at for this author
+            upsertMessage.run({
+              guild_id: interaction.guild.id,
+              user_id: m.author.id,
+              ts: m.createdTimestamp
+            });
+            usersTouched++;
+          }
+        }
+
+        const last = batch.last();
+        beforeId = last?.id;
+
+        // If the oldest message in this batch is older than our window, stop this channel
+        const oldestTs = batch.last()?.createdTimestamp ?? 0;
+        if (oldestTs < cutoff) break;
+      }
+    } catch {
+      // Ignore channels we cannot read
+    }
+  }
+
+  await interaction.followUp({
+    content:
+      `Hydrate complete.\n` +
+      `• Channels scanned: ${channelsScanned}\n` +
+      `• Messages scanned: ${messagesScanned}\n` +
+      `• Users updated: ~${usersTouched}`,
+    ephemeral: true
+  });
+}
 });
 
 // Use clientReady (v14 supports it; avoids deprecation warning ahead of v15)
