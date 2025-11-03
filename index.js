@@ -346,8 +346,7 @@ if (interaction.commandName === 'debug-channel') {
       const me = interaction.guild.members.me;
 
 function canScan(ch) {
-  // Allow classic text & announcement channels, threads, forums…
-  // AND allow voice channels (for Text-in-Voice) as long as we can read history.
+  // eligible if text-like OR a voice channel (for Text-in-Voice)
   const isEligibleType =
     ch?.isTextBased?.() ||
     ch?.type === ChannelType.GuildVoice;
@@ -361,7 +360,7 @@ function canScan(ch) {
 
 const baseChannels = targetChannel
   ? [targetChannel]
-  : interaction.guild.channels.cache.filter(canScan).map(c => c);
+  : Array.from(interaction.guild.channels.cache.values()).filter(canScan);
 => c);
 
       async function addActiveThreadsOf(channel, arr){
@@ -387,6 +386,11 @@ const baseChannels = targetChannel
         channelsScanned++;
         let scannedHere = 0;
         let beforeId = undefined;
+
+if (!channel.messages?.fetch) return; // skip channels without message API
+
+  let scannedHere = 0;
+  let beforeId = undefined;
 
         while (scannedHere < perChannelLimit) {
           const left = perChannelLimit - scannedHere;
