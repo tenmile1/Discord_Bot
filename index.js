@@ -242,15 +242,18 @@ client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
     const guild = interaction.guild;
-    if (!guild) return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
+    if (!guild) {
+      return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
+    }
 
-    // Permissions gate for admin actions
-    if (['inactive-scan','inactive-kick','hydrate-history'].includes(interaction.commandName)) {
+    // gatekeeper: mod perms for these commands
+    if (['inactive-scan', 'inactive-kick', 'hydrate-history', 'debug-activity'].includes(interaction.commandName)) {
       if (!interaction.memberPermissions.has(PermissionsBitField.Flags.KickMembers)) {
         return interaction.reply({ content: 'You need **Kick Members** permission to use this.', ephemeral: true });
       }
     }
 
+    // /inactive-scan
     if (interaction.commandName === 'inactive-scan') {
       const days = interaction.options.getInteger('days') ?? DEFAULT_INACTIVITY_DAYS;
       const minVcMinutes = interaction.options.getInteger('min_vc_minutes') ?? DEFAULT_MIN_VC_MINUTES;
@@ -267,13 +270,15 @@ client.on('interactionCreate', async (interaction) => {
         `Total: **${list.length}**\nSample: ${sample || '_None_'}${more}\n\n` +
         `Use **/inactive-kick confirm:true** to remove them.`
       );
+      return;
     }
 
+    // /inactive-kick
     if (interaction.commandName === 'inactive-kick') {
       const confirm = (interaction.options.getString('confirm') || '').toLowerCase().trim();
       if (confirm !== 'true') {
         return interaction.reply({ content: 'Type `true` in the `confirm` option to proceed.', ephemeral: true });
-      }
+        }
 
       const days = interaction.options.getInteger('days') ?? DEFAULT_INACTIVITY_DAYS;
       const minVcMinutes = interaction.options.getInteger('min_vc_minutes') ?? DEFAULT_MIN_VC_MINUTES;
@@ -286,103 +291,126 @@ client.on('interactionCreate', async (interaction) => {
       const kicked = await kickMembers(guild, ids);
 
       await interaction.editReply(`**Kicked ${kicked.length} / ${ids.length}** inactive members.`);
+      return;
     }
 
-if (interaction.commandName === 'hydrate-history') {
-  if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild)) {
-    return interaction.reply({ content: 'You need **Manage Server** to run this.', ephemeral: true });
-  }
-
-  const days = interaction.options.getInteger('days') ?? 90;
-  // allow deep scans; clamp 200..20000
-  const pclRaw = interaction.options.getInteger('per_channel_limit') ?? 500;
-  const perChannelLimit = Math.min(Math.max(pclRaw, 200), 20000);
-
-  const targetChannel = interaction.options.getChannel('channel');
-  const includeThreads = interaction.options.getBoolean('include_threads') ?? false;
-
-  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-
-  await interaction.reply({
-    content: `Hydrate starting (≤${days}d, up to ${perChannelLimit} msgs/channel)` +
-             (targetChannel ? ` on ${targetChannel}` : ` on all visible text channels`) +
-             (includeThreads ? ` + threads` : ``) + `…`,
-    ephemeral: true
-  });
-
-  let channelsScanned = 0, messagesScanned = 0, usersTouched = 0;
-
-  // Build list of channels to scan
-  /** @type {import('discord.js').AnyChannel[]} */
-  const baseChannels = targetChannel
-    ? [targetChannel]
-    : interaction.guild.channels.cache.filter(c => c?.isTextBased?.() && c.viewable).map(c => c);
-
-  // Optionally add threads of the selected channel
-  async function addActiveThreadsOf(channel, arr){
-    try {
-      const active = await channel.threads?.fetchActive();
-      const archived = await channel.threads?.fetchArchived?.();
-      if (active?.threads) arr.push(...active.threads.filter(t => t.viewable).map(t => t));
-      if (archived?.threads) arr.push(...archived.threads.filter(t => t.viewable).map(t => t));
-    } catch { /* ignore */ }
-  }
-
-  const channelsToScan = [];
-  for (const ch of baseChannels) {
-    if (ch.isTextBased?.() && ch.viewable) {
-      channelsToScan.push(ch);
-      if (includeThreads && 'threads' in ch) {
-        await addActiveThreadsOf(ch, channelsToScan);
+    // /hydrate-history
+    if (interaction.commandName === 'hydrate-history') {
+      if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild)) {
+        return interaction.reply({ content: 'You need **Manage Server** to run this.', ephemeral: true });
       }
-    }
-  }
 
-  // Scanner for a single text-like channel
-  async function scanChannel(channel){
-    channelsScanned++;
-    let scannedHere = 0;
-    let beforeId = undefined;
+      const days = interaction.options.getInteger('days') ?? 90;
+      const pclRaw = interaction.options.getInteger('per_channel_limit') ?? 500;
+      const perChannelLimit = Math.min(Math.max(pclRaw, 200), 20000);
+      const targetChannel = interaction.options.getChannel('channel');
+      const includeThreads = interaction.options.getBoolean('include_threads') ?? false;
 
-    while (scannedHere < perChannelLimit) {
-      const left = perChannelLimit - scannedHere;
-      const batch = await channel.messages.fetch({ limit: Math.min(100, left), before: beforeId }).catch(() => null);
-      if (!batch || batch.size === 0) break;
+      const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
 
-      for (const [, m] of batch) {
-        scannedHere++; messagesScanned++;
-        if (!m.author?.bot && m.createdTimestamp >= cutoff) {
-          upsertMessage.run({ guild_id: interaction.guild.id, user_id: m.author.id, ts: m.createdTimestamp });
-          usersTouched++;
+      await interaction.reply({
+        content: `Hydrate starting (≤${days}d, up to ${perChannelLimit} msgs/channel)` +
+                 (targetChannel ? ` on ${targetChannel}` : ` on all visible text channels`) +
+                 (includeThreads ? ` + threads` : ``) + `…`,
+        ephemeral: true
+      });
+
+      let channelsScanned = 0, messagesScanned = 0, usersTouched = 0;
+      function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+      const baseChannels = targetChannel
+        ? [targetChannel]
+        : interaction.guild.channels.cache.filter(c => c?.isTextBased?.() && c.viewable).map(c => c);
+
+      async function addActiveThreadsOf(channel, arr){
+        try {
+          const active = await channel.threads?.fetchActive();
+          const archived = await channel.threads?.fetchArchived?.();
+          if (active?.threads) arr.push(...active.threads.filter(t => t.viewable).map(t => t));
+          if (archived?.threads) arr.push(...archived.threads.filter(t => t.viewable).map(t => t));
+        } catch {/* ignore */}
+      }
+
+      const channelsToScan = [];
+      for (const ch of baseChannels) {
+        if (ch.isTextBased?.() && ch.viewable) {
+          channelsToScan.push(ch);
+          if (includeThreads && 'threads' in ch) {
+            await addActiveThreadsOf(ch, channelsToScan);
+          }
         }
       }
 
-      const last = batch.last();
-      beforeId = last?.id;
+      async function scanChannel(channel){
+        channelsScanned++;
+        let scannedHere = 0;
+        let beforeId = undefined;
 
-      const oldestTs = batch.last()?.createdTimestamp ?? 0;
-      if (oldestTs < cutoff) break; // we went past window
+        while (scannedHere < perChannelLimit) {
+          const left = perChannelLimit - scannedHere;
+          const batch = await channel.messages.fetch({ limit: Math.min(100, left), before: beforeId }).catch(() => null);
+          if (!batch || batch.size === 0) break;
 
-      // gentle backoff to avoid rate limits
-      await sleep(350);
+          for (const [, m] of batch) {
+            scannedHere++; messagesScanned++;
+            if (!m.author?.bot && m.createdTimestamp >= cutoff) {
+              upsertMessage.run({ guild_id: interaction.guild.id, user_id: m.author.id, ts: m.createdTimestamp });
+              usersTouched++;
+            }
+          }
+
+          const last = batch.last();
+          beforeId = last?.id;
+          const oldestTs = batch.last()?.createdTimestamp ?? 0;
+          if (oldestTs < cutoff) break;
+
+          await sleep(350);
+        }
+      }
+
+      for (const ch of channelsToScan) {
+        try { await scanChannel(ch); } catch {/* skip */}
+      }
+
+      await interaction.followUp({
+        content:
+          `Hydrate complete.\n` +
+          `• Channels scanned: ${channelsScanned}\n` +
+          `• Messages scanned: ${messagesScanned}\n` +
+          `• Users updated: ~${usersTouched}\n` +
+          (targetChannel ? `• Channel: ${targetChannel}` : ''),
+        ephemeral: true
+      });
+      return;
     }
-  }
 
-  for (const ch of channelsToScan) {
-    try { await scanChannel(ch); } catch { /* skip problematic channel */ }
-  }
+    // /debug-activity (optional helper)
+    if (interaction.commandName === 'debug-activity') {
+      const u = interaction.options.getUser('user');
+      const row = getActivityRow(interaction.guild.id, u.id);
+      const toDate = ts => ts ? new Date(ts).toISOString() : 'none';
+      await interaction.reply({
+        content:
+          `User: <@${u.id}>\n` +
+          `last_message_at: ${toDate(row.last_message_at)}\n` +
+          `last_vc_at:     ${toDate(row.last_vc_at)}\n` +
+          `vc_seconds_total: ${row.vc_seconds_total || 0}`,
+        ephemeral: true
+      });
+      return;
+    }
 
-    await interaction.followUp({
-    content:
-      `Hydrate complete.\n` +
-      `• Channels scanned: ${channelsScanned}\n` +
-      `• Messages scanned: ${messagesScanned}\n` +
-      `• Users updated: ~${usersTouched}\n` +
-      (targetChannel ? `• Channel: ${targetChannel}` : ''),
-    ephemeral: true
-  });
-}   // end hydrate-history IF block
-}); // end client.on('interactionCreate', ...) handler
+  } catch (e) {
+    console.error('interactionCreate error:', e);
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply('Something went wrong. Check permissions and try again.');
+      } else {
+        await interaction.reply({ content: 'Something went wrong. Check permissions and try again.', ephemeral: true });
+      }
+    } catch {}
+  }
+});
 
 // Optional: daily dry-run log at 04:00
 new cron.CronJob('0 4 * * *', async () => {
@@ -396,7 +424,7 @@ new cron.CronJob('0 4 * * *', async () => {
   }
 }, null, true);
 
-// Use clientReady (future-proof for v15)
+// Use clientReady (to avoid the deprecation warning you saw)
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   try {
