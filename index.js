@@ -381,9 +381,6 @@ if (interaction.commandName === 'hydrate-history') {
       (targetChannel ? `• Channel: ${targetChannel}` : ''),
     ephemeral: true
   });
-}
-
-});
 
 // Optional: daily dry-run log at 04:00
 new cron.CronJob('0 4 * * *', async () => {
