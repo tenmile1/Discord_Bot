@@ -1,6 +1,8 @@
 // index.js
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, REST, Routes, PermissionsBitField, ChannelType } = require('discord.js');
+const {
+  Client, GatewayIntentBits, Partials, REST, Routes, PermissionsBitField, ChannelType, EmbedBuilder
+} = require('discord.js');
 const Database = require('better-sqlite3');
 const cron = require('cron');
 const path = require('path');
@@ -25,6 +27,17 @@ db.exec(`
   )
 `);
 
+// migrations for guild_settings + optional columns
+db.exec(`
+  CREATE TABLE IF NOT EXISTS guild_settings (
+    guild_id TEXT PRIMARY KEY,
+    modlog_channel_id TEXT
+  )
+`);
+try {
+  db.exec(`ALTER TABLE guild_settings ADD COLUMN healthlog_channel_id TEXT`);
+} catch (_) { /* column already exists, ignore */ }
+
 const upsertMessage = db.prepare(`
   INSERT INTO user_activity (guild_id, user_id, last_message_at)
   VALUES (@guild_id, @user_id, @ts)
@@ -48,27 +61,24 @@ const addVcSeconds = db.prepare(`
     last_vc_at = MAX(COALESCE(user_activity.last_vc_at, 0), excluded.last_vc_at)
 `);
 
-// ---- Guild settings (for daily reports) ----
-db.exec(`
-  CREATE TABLE IF NOT EXISTS guild_settings (
-    guild_id TEXT PRIMARY KEY,
-    modlog_channel_id TEXT
-  )
-`);
-
+// ---- Guild settings helpers ----
 const setModlog = db.prepare(`
   INSERT INTO guild_settings (guild_id, modlog_channel_id)
   VALUES (?, ?)
   ON CONFLICT(guild_id) DO UPDATE SET modlog_channel_id = excluded.modlog_channel_id
 `);
+const getModlog = db.prepare(`SELECT modlog_channel_id, healthlog_channel_id FROM guild_settings WHERE guild_id = ?`);
 
-const getModlog = db.prepare(`
-  SELECT modlog_channel_id FROM guild_settings WHERE guild_id = ?
+const setHealthlog = db.prepare(`
+  INSERT INTO guild_settings (guild_id, healthlog_channel_id)
+  VALUES (?, ?)
+  ON CONFLICT(guild_id) DO UPDATE SET healthlog_channel_id = excluded.healthlog_channel_id
 `);
 
 // ---- Utils ----
 function nowMs() { return Date.now(); }
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+function msFromDays(days) { return days * 24 * 60 * 60 * 1000; }
 
 // ---- Track active VC sessions in memory ----
 const activeVcSessions = new Map(); // key: `${guildId}:${userId}` -> joinTimestampMs
@@ -150,10 +160,13 @@ const commands = [
   },
   {
     name: 'modlog-set',
-    description: 'Set the channel where daily inactivity reports are posted.',
-    options: [
-      { name: 'channel', description: 'Channel to use for mod logs', type: 7, required: true }
-    ]
+    description: 'Set the channel where daily inactivity reports are posted (04:00).',
+    options: [{ name: 'channel', description: 'Channel to use for inactive scan reports', type: 7, required: true }]
+  },
+  {
+    name: 'healthlog-set',
+    description: 'Set the channel where the 12:30 PT Server Health Snapshot posts.',
+    options: [{ name: 'channel', description: 'Channel to use for health snapshots', type: 7, required: true }]
   }
 ];
 
@@ -161,10 +174,7 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
   // 1) Clear GLOBAL commands to remove duplicates everywhere
-  await rest.put(
-    Routes.applicationCommands(process.env.CLIENT_ID),
-    { body: [] }
-  );
+  await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: [] });
   console.log('✓ Cleared global commands');
 
   // 2) Register GUILD commands (instant in your server)
@@ -175,18 +185,12 @@ async function registerCommands() {
     );
     console.log(`✓ Slash commands registered (guild: ${process.env.GUILD_ID})`);
   } else {
-    // (fallback) If no GUILD_ID set, you can register globally instead
-    await rest.put(
-      Routes.applicationCommands(process.env.CLIENT_ID),
-      { body: commands }
-    );
+    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
     console.log('✓ Slash commands registered (global)');
   }
 }
 
 // ---- Helpers ----
-function msFromDays(days) { return days * 24 * 60 * 60 * 1000; }
-
 function memberIsProtected(member) {
   if (!member) return true;
   if (member.user.bot) return true;
@@ -255,10 +259,8 @@ async function getModLogChannel(guild) {
   const row = getModlog.get(guild.id);
   const idFromDb = row?.modlog_channel_id;
   const idFromEnv = process.env.MOD_LOG_CHANNEL_ID; // optional fallback for all guilds
-
   const channelId = idFromDb || idFromEnv;
   if (!channelId) return null;
-
   try {
     const ch = await guild.channels.fetch(channelId);
     if (!ch || !ch.isTextBased?.() || !ch.viewable) return null;
@@ -268,7 +270,22 @@ async function getModLogChannel(guild) {
   }
 }
 
-// ---- Events ----
+async function getHealthLogChannel(guild) {
+  const row = getModlog.get(guild.id);
+  const idFromDb = row?.healthlog_channel_id;
+  const idFromEnv = process.env.HEALTH_LOG_CHANNEL_ID; // optional fallback
+  const channelId = idFromDb || idFromEnv;
+  if (!channelId) return null;
+  try {
+    const ch = await guild.channels.fetch(channelId);
+    if (!ch || !ch.isTextBased?.() || !ch.viewable) return null;
+    return ch;
+  } catch {
+    return null;
+  }
+}
+
+// ---- Events: activity tracking ----
 client.on('messageCreate', (msg) => {
   if (!msg.guild || msg.author.bot) return;
   try {
@@ -289,13 +306,9 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 
   try {
     if (!wasIn && isIn) {
-      // joined VC
       activeVcSessions.set(key, now);
       upsertVcJoin.run({ guild_id: guildId, user_id: userId, ts: now });
-
-      // if Connect was needed for text-in-voice, this ensures last_vc_at is updated
     } else if (wasIn && !isIn) {
-      // left VC
       const start = activeVcSessions.get(key);
       if (start) {
         const delta = Math.max(0, Math.floor((now - start) / 1000));
@@ -303,7 +316,6 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         activeVcSessions.delete(key);
       }
     } else if (wasIn && isIn && oldState.channelId !== newState.channelId) {
-      // moved VC
       const start = activeVcSessions.get(key);
       if (start) {
         const delta = Math.max(0, Math.floor((now - start) / 1000));
@@ -317,17 +329,16 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   }
 });
 
+// ---- Commands ----
 client.on('interactionCreate', async (interaction) => {
   try {
     if (!interaction.isChatInputCommand()) return;
 
     const guild = interaction.guild;
-    if (!guild) {
-      return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
-    }
+    if (!guild) return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
 
-    // gatekeeper: mod perms for these commands
-    if (['inactive-scan', 'inactive-kick', 'hydrate-history', 'debug-activity', 'modlog-set'].includes(interaction.commandName)) {
+    // gatekeeper: mod perms
+    if (['inactive-scan','inactive-kick','hydrate-history','debug-activity','modlog-set','healthlog-set'].includes(interaction.commandName)) {
       if (!interaction.memberPermissions.has(PermissionsBitField.Flags.KickMembers)) {
         return interaction.reply({ content: 'You need **Kick Members** permission to use this.', ephemeral: true });
       }
@@ -357,7 +368,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'inactive-kick') {
       const confirm = (interaction.options.getString('confirm') || '').toLowerCase().trim();
       if (confirm !== 'true') {
-        return interaction.reply({ content: 'Type \`true\` in the \`confirm\` option to proceed.', ephemeral: true });
+        return interaction.reply({ content: 'Type `true` in the `confirm` option to proceed.', ephemeral: true });
       }
 
       const days = interaction.options.getInteger('days') ?? DEFAULT_INACTIVITY_DAYS;
@@ -575,13 +586,21 @@ client.on('interactionCreate', async (interaction) => {
       if (!channel?.isTextBased?.() || !channel.viewable) {
         return interaction.reply({ content: 'Please choose a text channel I can see.', ephemeral: true });
       }
-      try {
-        setModlog.run(interaction.guild.id, channel.id);
-        await interaction.reply({ content: `Mod-log channel set to ${channel}.`, ephemeral: true });
-      } catch (e) {
-        await interaction.reply({ content: `Failed to save: ${e.message}`, ephemeral: true });
+      setModlog.run(interaction.guild.id, channel.id);
+      return interaction.reply({ content: `Inactive-scan reports will post to ${channel}.`, ephemeral: true });
+    }
+
+    // /healthlog-set
+    if (interaction.commandName === 'healthlog-set') {
+      if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild)) {
+        return interaction.reply({ content: 'You need **Manage Server** to run this.', ephemeral: true });
       }
-      return;
+      const channel = interaction.options.getChannel('channel');
+      if (!channel?.isTextBased?.() || !channel.viewable) {
+        return interaction.reply({ content: 'Please choose a text channel I can see.', ephemeral: true });
+      }
+      setHealthlog.run(interaction.guild.id, channel.id);
+      return interaction.reply({ content: `Server Health Snapshots will post to ${channel} at 12:30 PT.`, ephemeral: true });
     }
 
   } catch (e) {
@@ -596,7 +615,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// --- Scheduled: Daily 04:00 report to mod-log channel (if set), else console ---
+// --- Scheduled: Daily 04:00 inactive scan -> mod-log channel ---
 new cron.CronJob('0 4 * * *', async () => {
   for (const [, guild] of client.guilds.cache) {
     try {
@@ -614,16 +633,64 @@ new cron.CronJob('0 4 * * *', async () => {
         (DEFAULT_MIN_VC_MINUTES > 0 ? ` & < ${DEFAULT_MIN_VC_MINUTES} VC mins` : ``);
 
       const ch = await getModLogChannel(guild);
-      if (ch) {
-        await ch.send({ content: line });
-      } else {
-        console.log(`[${guild.name}] ${line.replace(/\n/g, ' ')}`);
-      }
+      if (ch) await ch.send({ content: line });
+      else console.log(`[${guild.name}] ${line.replace(/\n/g, ' ')}`);
     } catch (e) {
       console.warn(`[${guild.id}] daily mod-log failed:`, e.message);
     }
   }
-}, null, true);
+}, null, true, 'America/Los_Angeles');
+
+// --- Scheduled: Daily 12:30 PT Server Health Snapshot -> health-log channel ---
+new cron.CronJob('30 12 * * *', async () => {
+  for (const [, guild] of client.guilds.cache) {
+    try {
+      const ch = await getHealthLogChannel(guild);
+      if (!ch) continue;
+
+      // Gather snapshot
+      const members = await fetchAllMembers(guild);
+      let textSenders = 0;
+      let textMsgs = 0;
+      let vcJoins = 0;
+
+      // Count last 24h text senders/messages from stored activity (approximate: last_message_at)
+      const since = nowMs() - (24 * 60 * 60 * 1000);
+      for (const [, m] of members) {
+        const row = getActivityRow(guild.id, m.id);
+        if (row.last_message_at && row.last_message_at >= since) {
+          textSenders++;
+          textMsgs++; // we don't track counts; treat as at least 1 per sender for headline
+        }
+        if (row.last_vc_at && row.last_vc_at >= since) vcJoins++;
+      }
+
+      const activeUsers = textSenders; // proxy for "active today"
+      const needsBoost = activeUsers < 15;
+
+      const embed = new EmbedBuilder()
+        .setTitle('📊 Server Health Snapshot (last 24h)')
+        .setDescription(
+          'ahoy you sea dwelling studiers! Let\'s see how many people sailed the oceanside seas today 🏴‍☠️'
+        )
+        .addFields(
+          { name: 'Active users (proxy)', value: `**${activeUsers}**`, inline: true },
+          { name: 'Text senders', value: `**${textSenders}**`, inline: true },
+          { name: 'VC joins', value: `**${vcJoins}**`, inline: true }
+        )
+        .setFooter({ text: `Cutoff for “needs boost”: < 15 active users` })
+        .setTimestamp(new Date());
+
+      const preface = needsBoost
+        ? '⚠️ **Activity looks low today (<15 active users).** Consider posting a prompt or hosting a quick study VC!'
+        : '✅ **Looks healthy!** Keep the momentum going.';
+
+      await ch.send({ content: preface, embeds: [embed] });
+    } catch (e) {
+      console.warn(`[${guild.id}] health snapshot failed:`, e.message);
+    }
+  }
+}, null, true, 'America/Los_Angeles');
 
 // Use clientReady (to avoid the deprecation warning you saw)
 client.once('clientReady', async () => {
