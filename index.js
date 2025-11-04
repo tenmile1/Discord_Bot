@@ -7,7 +7,7 @@ const path = require('path');
 
 // ---- Config ----
 const DEFAULT_INACTIVITY_DAYS = 90;
-const DEFAULT_MIN_VC_MINUTES = 0;
+const DEFAULT_MIN_VC_MINUTES = 0; // minutes of VC time that count as "active" within window
 const MAX_PREVIEW = 50;
 
 // ---- DB Setup (persistent path via DB_PATH or local file) ----
@@ -48,6 +48,25 @@ const addVcSeconds = db.prepare(`
     last_vc_at = MAX(COALESCE(user_activity.last_vc_at, 0), excluded.last_vc_at)
 `);
 
+// ---- Guild settings (for daily reports) ----
+db.exec(`
+  CREATE TABLE IF NOT EXISTS guild_settings (
+    guild_id TEXT PRIMARY KEY,
+    modlog_channel_id TEXT
+  )
+`);
+
+const setModlog = db.prepare(`
+  INSERT INTO guild_settings (guild_id, modlog_channel_id)
+  VALUES (?, ?)
+  ON CONFLICT(guild_id) DO UPDATE SET modlog_channel_id = excluded.modlog_channel_id
+`);
+
+const getModlog = db.prepare(`
+  SELECT modlog_channel_id FROM guild_settings WHERE guild_id = ?
+`);
+
+// ---- Utils ----
 function nowMs() { return Date.now(); }
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
@@ -77,19 +96,6 @@ const commands = [
       { name: 'exclude_role', description: 'Exclude anyone with this role.', type: 8, required: false }
     ]
   },
-{
-  name: 'peek-channel',
-  description: 'Show the last few messages in a channel (for debugging).',
-  options: [
-    { name: 'channel', description: 'Channel to inspect', type: 7, required: true },
-    { name: 'limit', description: 'How many messages (default 10, max 25).', type: 4, required: false }
-  ]
-},
-{
-  name: 'debug-channel',
-  description: 'Inspect a channel: type, isTextBased, permissions.',
-  options: [{ name: 'channel', description: 'Channel to inspect', type: 7, required: true }]
-},
   {
     name: 'inactive-kick',
     description: 'Kick members who have been inactive for N days (requires confirm).',
@@ -101,15 +107,54 @@ const commands = [
     ]
   },
   {
-  name: 'hydrate-history',
-  description: 'Backfill recent messages into last_message_at.',
-  options: [
-    { name: 'days', description: 'How many days back (default 90).', type: 4, required: false },
-    { name: 'per_channel_limit', description: 'Max messages per channel (default 500).', type: 4, required: false },
-    { name: 'channel', description: 'Only scan this channel.', type: 7, required: false },
-    { name: 'include_threads', description: 'Also scan active threads of the channel.', type: 5, required: false }
-  ]
-}
+    name: 'hydrate-history',
+    description: 'Backfill recent messages into last_message_at.',
+    options: [
+      { name: 'days', description: 'How many days back (default 90).', type: 4, required: false },
+      { name: 'per_channel_limit', description: 'Max messages per channel (default 500).', type: 4, required: false },
+      {
+        name: 'channel',
+        description: 'Only scan this channel (supports voice channels with text).',
+        type: 7,
+        required: false,
+        channel_types: [
+          ChannelType.GuildText,
+          ChannelType.GuildAnnouncement,
+          ChannelType.GuildVoice,
+          ChannelType.PublicThread,
+          ChannelType.PrivateThread,
+          ChannelType.AnnouncementThread,
+          ChannelType.GuildForum
+        ]
+      },
+      { name: 'include_threads', description: 'Also scan active threads of the channel.', type: 5, required: false }
+    ]
+  },
+  {
+    name: 'peek-channel',
+    description: 'Show the last few messages in a channel (for debugging).',
+    options: [
+      { name: 'channel', description: 'Channel to inspect', type: 7, required: true },
+      { name: 'limit', description: 'How many messages (default 10, max 25).', type: 4, required: false }
+    ]
+  },
+  {
+    name: 'debug-channel',
+    description: 'Inspect a channel: type, isTextBased, permissions.',
+    options: [{ name: 'channel', description: 'Channel to inspect', type: 7, required: true }]
+  },
+  {
+    name: 'debug-activity',
+    description: 'Show stored activity for a user.',
+    options: [{ name: 'user', description: 'User to inspect', type: 6, required: true }]
+  },
+  {
+    name: 'modlog-set',
+    description: 'Set the channel where daily inactivity reports are posted.',
+    options: [
+      { name: 'channel', description: 'Channel to use for mod logs', type: 7, required: true }
+    ]
+  }
 ];
 
 async function registerCommands() {
@@ -206,6 +251,23 @@ async function kickMembers(guild, userIds) {
   return kicked;
 }
 
+async function getModLogChannel(guild) {
+  const row = getModlog.get(guild.id);
+  const idFromDb = row?.modlog_channel_id;
+  const idFromEnv = process.env.MOD_LOG_CHANNEL_ID; // optional fallback for all guilds
+
+  const channelId = idFromDb || idFromEnv;
+  if (!channelId) return null;
+
+  try {
+    const ch = await guild.channels.fetch(channelId);
+    if (!ch || !ch.isTextBased?.() || !ch.viewable) return null;
+    return ch;
+  } catch {
+    return null;
+  }
+}
+
 // ---- Events ----
 client.on('messageCreate', (msg) => {
   if (!msg.guild || msg.author.bot) return;
@@ -227,9 +289,13 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 
   try {
     if (!wasIn && isIn) {
+      // joined VC
       activeVcSessions.set(key, now);
       upsertVcJoin.run({ guild_id: guildId, user_id: userId, ts: now });
+
+      // if Connect was needed for text-in-voice, this ensures last_vc_at is updated
     } else if (wasIn && !isIn) {
+      // left VC
       const start = activeVcSessions.get(key);
       if (start) {
         const delta = Math.max(0, Math.floor((now - start) / 1000));
@@ -237,6 +303,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         activeVcSessions.delete(key);
       }
     } else if (wasIn && isIn && oldState.channelId !== newState.channelId) {
+      // moved VC
       const start = activeVcSessions.get(key);
       if (start) {
         const delta = Math.max(0, Math.floor((now - start) / 1000));
@@ -260,7 +327,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     // gatekeeper: mod perms for these commands
-    if (['inactive-scan', 'inactive-kick', 'hydrate-history', 'debug-activity'].includes(interaction.commandName)) {
+    if (['inactive-scan', 'inactive-kick', 'hydrate-history', 'debug-activity', 'modlog-set'].includes(interaction.commandName)) {
       if (!interaction.memberPermissions.has(PermissionsBitField.Flags.KickMembers)) {
         return interaction.reply({ content: 'You need **Kick Members** permission to use this.', ephemeral: true });
       }
@@ -285,72 +352,13 @@ client.on('interactionCreate', async (interaction) => {
       );
       return;
     }
-if (interaction.commandName === 'debug-channel') {
-  const ch = interaction.options.getChannel('channel');
-  const me = interaction.guild.members.me;
-  const perms = ch.permissionsFor?.(me) ?? new PermissionsBitField(0);
-  const canView = perms.has(PermissionsBitField.Flags.ViewChannel);
-  const canReadHist = perms.has(PermissionsBitField.Flags.ReadMessageHistory);
-  const canSend = perms.has(PermissionsBitField.Flags.SendMessages);
-  const isTextBased = ch.isTextBased?.() ? 'yes' : 'no';
-  await interaction.reply({
-    content:
-      `Channel: ${ch} (id: ${ch.id})\n` +
-      `type: ${ch.type}\n` +
-      `isTextBased(): ${isTextBased}\n` +
-      `viewable: ${ch.viewable ? 'yes' : 'no'}\n` +
-      `perms(ViewChannel): ${canView}\n` +
-      `perms(ReadMessageHistory): ${canReadHist}\n` +
-      `perms(SendMessages): ${canSend}`,
-    ephemeral: true
-  });
-  return;
-}
-if (interaction.commandName === 'peek-channel') {
-  const ch = interaction.options.getChannel('channel');
-  const lim = Math.min(Math.max(interaction.options.getInteger('limit') ?? 10, 1), 25);
 
-  const me = interaction.guild.members.me;
-  const perms = ch.permissionsFor?.(me);
-  const canView = !!perms && perms.has(PermissionsBitField.Flags.ViewChannel);
-  const canRead = !!perms && perms.has(PermissionsBitField.Flags.ReadMessageHistory);
-
-  if (!canView || !canRead || !ch.messages?.fetch) {
-    return interaction.reply({ content: 'I cannot read messages in that channel.', ephemeral: true });
-  }
-
-  let batch;
-  try {
-    batch = await ch.messages.fetch({ limit: lim });
-  } catch (e) {
-    return interaction.reply({ content: `Fetch failed: ${e.message}`, ephemeral: true });
-  }
-  if (!batch || batch.size === 0) {
-    return interaction.reply({ content: 'No messages returned.', ephemeral: true });
-  }
-
-  const lines = [];
-  let i = 0;
-  for (const [, m] of batch) {
-    if (i++ >= lim) break;
-    const when = new Date(m.createdTimestamp).toISOString();
-    const who = m.author?.bot ? `(bot) ${m.author.tag}` : m.author?.tag;
-    const text = (m.content || '[embed/attachment]').slice(0, 60).replace(/\n/g, ' ');
-    lines.push(`• ${when} — ${who}: ${text}`);
-  }
-
-  await interaction.reply({
-    content: `Last ${lines.length} messages in ${ch}:\n` + lines.join('\n'),
-    ephemeral: true
-  });
-  return;
-}
     // /inactive-kick
     if (interaction.commandName === 'inactive-kick') {
       const confirm = (interaction.options.getString('confirm') || '').toLowerCase().trim();
       if (confirm !== 'true') {
-        return interaction.reply({ content: 'Type `true` in the `confirm` option to proceed.', ephemeral: true });
-        }
+        return interaction.reply({ content: 'Type \`true\` in the \`confirm\` option to proceed.', ephemeral: true });
+      }
 
       const days = interaction.options.getInteger('days') ?? DEFAULT_INACTIVITY_DAYS;
       const minVcMinutes = interaction.options.getInteger('min_vc_minutes') ?? DEFAULT_MIN_VC_MINUTES;
@@ -388,26 +396,19 @@ if (interaction.commandName === 'peek-channel') {
       });
 
       let channelsScanned = 0, messagesScanned = 0, usersTouched = 0;
-      function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
       const me = interaction.guild.members.me;
+      function canScan(ch) {
+        const isEligibleType = ch?.isTextBased?.() || ch?.type === ChannelType.GuildVoice;
+        const perms = ch.permissionsFor?.(me);
+        const canView = !!perms && perms.has(PermissionsBitField.Flags.ViewChannel);
+        const canRead = !!perms && perms.has(PermissionsBitField.Flags.ReadMessageHistory);
+        return !!ch && isEligibleType && ch.viewable && canView && canRead;
+      }
 
-function canScan(ch) {
-  // eligible if text-like OR a voice channel (for Text-in-Voice)
-  const isEligibleType =
-    ch?.isTextBased?.() ||
-    ch?.type === ChannelType.GuildVoice;
-
-  const perms = ch.permissionsFor?.(me);
-  const canView = !!perms && perms.has(PermissionsBitField.Flags.ViewChannel);
-  const canRead = !!perms && perms.has(PermissionsBitField.Flags.ReadMessageHistory);
-
-  return !!ch && isEligibleType && ch.viewable && canView && canRead;
-}
-
-const baseChannels = targetChannel
-  ? [targetChannel]
-  : Array.from(interaction.guild.channels.cache.values()).filter(canScan);
+      const baseChannels = targetChannel
+        ? [targetChannel]
+        : Array.from(interaction.guild.channels.cache.values()).filter(canScan);
 
       async function addActiveThreadsOf(channel, arr){
         try {
@@ -429,51 +430,48 @@ const baseChannels = targetChannel
       }
 
       async function scanChannel(channel){
-  channelsScanned++;
+        channelsScanned++;
 
-  // skip channels without a messages API (some voice channels without text)
-  if (!channel || !channel.messages || !channel.messages.fetch) return;
+        if (!channel || !channel.messages || !channel.messages.fetch) return;
 
-  let scannedHere = 0;
-  let beforeId = undefined;
+        let scannedHere = 0;
+        let beforeId = undefined;
 
-  while (scannedHere < perChannelLimit) {
-    const left = perChannelLimit - scannedHere;
+        while (scannedHere < perChannelLimit) {
+          const left = perChannelLimit - scannedHere;
+          let batch;
+          try {
+            batch = await channel.messages.fetch({ limit: Math.min(100, left), before: beforeId });
+          } catch {
+            break;
+          }
+          if (!batch || batch.size === 0) break;
 
-    let batch;
-    try {
-      batch = await channel.messages.fetch({ limit: Math.min(100, left), before: beforeId });
-    } catch {
-      break; // cannot fetch this channel's messages
-    }
-    if (!batch || batch.size === 0) break;
+          for (const [, m] of batch) {
+            scannedHere++;
+            messagesScanned++;
+            if (!m.author?.bot && m.createdTimestamp >= cutoff) {
+              upsertMessage.run({
+                guild_id: interaction.guild.id,
+                user_id: m.author.id,
+                ts: m.createdTimestamp
+              });
+              usersTouched++;
+            }
+          }
 
-    for (const [, m] of batch) {
-      scannedHere++;
-      messagesScanned++;
-      if (!m.author?.bot && m.createdTimestamp >= cutoff) {
-        upsertMessage.run({
-          guild_id: interaction.guild.id,
-          user_id: m.author.id,
-          ts: m.createdTimestamp
-        });
-        usersTouched++;
+          const last = batch.last();
+          beforeId = last?.id;
+
+          const oldestTs = batch.last()?.createdTimestamp ?? 0;
+          if (oldestTs < cutoff) break;
+
+          await sleep(350);
+        }
       }
-    }
-
-    const last = batch.last();
-    beforeId = last?.id;
-
-    const oldestTs = batch.last()?.createdTimestamp ?? 0;
-    if (oldestTs < cutoff) break;
-
-    await sleep(350); // gentle rate-limit backoff
-  }
-}
-
 
       for (const ch of channelsToScan) {
-        try { await scanChannel(ch); } catch {/* skip */}
+        try { await scanChannel(ch); } catch {/* skip problematic channel */ }
       }
 
       await interaction.followUp({
@@ -488,7 +486,71 @@ const baseChannels = targetChannel
       return;
     }
 
-    // /debug-activity (optional helper)
+    // /peek-channel
+    if (interaction.commandName === 'peek-channel') {
+      const ch = interaction.options.getChannel('channel');
+      const lim = Math.min(Math.max(interaction.options.getInteger('limit') ?? 10, 1), 25);
+
+      const me = interaction.guild.members.me;
+      const perms = ch.permissionsFor?.(me);
+      const canView = !!perms && perms.has(PermissionsBitField.Flags.ViewChannel);
+      const canRead = !!perms && perms.has(PermissionsBitField.Flags.ReadMessageHistory);
+
+      if (!canView || !canRead || !ch.messages?.fetch) {
+        return interaction.reply({ content: 'I cannot read messages in that channel.', ephemeral: true });
+      }
+
+      let batch;
+      try {
+        batch = await ch.messages.fetch({ limit: lim });
+      } catch (e) {
+        return interaction.reply({ content: `Fetch failed: ${e.message}`, ephemeral: true });
+      }
+      if (!batch || batch.size === 0) {
+        return interaction.reply({ content: 'No messages returned.', ephemeral: true });
+      }
+
+      const lines = [];
+      let i = 0;
+      for (const [, m] of batch) {
+        if (i++ >= lim) break;
+        const when = new Date(m.createdTimestamp).toISOString();
+        const who = m.author?.bot ? `(bot) ${m.author.tag}` : m.author?.tag;
+        const text = (m.content || '[embed/attachment]').slice(0, 60).replace(/\n/g, ' ');
+        lines.push(`• ${when} — ${who}: ${text}`);
+      }
+
+      await interaction.reply({
+        content: `Last ${lines.length} messages in ${ch}:\n` + lines.join('\n'),
+        ephemeral: true
+      });
+      return;
+    }
+
+    // /debug-channel
+    if (interaction.commandName === 'debug-channel') {
+      const ch = interaction.options.getChannel('channel');
+      const me = interaction.guild.members.me;
+      const perms = ch.permissionsFor?.(me) ?? new PermissionsBitField(0);
+      const canView = perms.has(PermissionsBitField.Flags.ViewChannel);
+      const canReadHist = perms.has(PermissionsBitField.Flags.ReadMessageHistory);
+      const canSend = perms.has(PermissionsBitField.Flags.SendMessages);
+      const isTextBased = ch.isTextBased?.() ? 'yes' : 'no';
+      await interaction.reply({
+        content:
+          `Channel: ${ch} (id: ${ch.id})\n` +
+          `type: ${ch.type}\n` +
+          `isTextBased(): ${isTextBased}\n` +
+          `viewable: ${ch.viewable ? 'yes' : 'no'}\n` +
+          `perms(ViewChannel): ${canView}\n` +
+          `perms(ReadMessageHistory): ${canReadHist}\n` +
+          `perms(SendMessages): ${canSend}`,
+        ephemeral: true
+      });
+      return;
+    }
+
+    // /debug-activity
     if (interaction.commandName === 'debug-activity') {
       const u = interaction.options.getUser('user');
       const row = getActivityRow(interaction.guild.id, u.id);
@@ -504,6 +566,24 @@ const baseChannels = targetChannel
       return;
     }
 
+    // /modlog-set
+    if (interaction.commandName === 'modlog-set') {
+      if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild)) {
+        return interaction.reply({ content: 'You need **Manage Server** to run this.', ephemeral: true });
+      }
+      const channel = interaction.options.getChannel('channel');
+      if (!channel?.isTextBased?.() || !channel.viewable) {
+        return interaction.reply({ content: 'Please choose a text channel I can see.', ephemeral: true });
+      }
+      try {
+        setModlog.run(interaction.guild.id, channel.id);
+        await interaction.reply({ content: `Mod-log channel set to ${channel}.`, ephemeral: true });
+      } catch (e) {
+        await interaction.reply({ content: `Failed to save: ${e.message}`, ephemeral: true });
+      }
+      return;
+    }
+
   } catch (e) {
     console.error('interactionCreate error:', e);
     try {
@@ -516,14 +596,31 @@ const baseChannels = targetChannel
   }
 });
 
-// Optional: daily dry-run log at 04:00
+// --- Scheduled: Daily 04:00 report to mod-log channel (if set), else console ---
 new cron.CronJob('0 4 * * *', async () => {
   for (const [, guild] of client.guilds.cache) {
     try {
-      const res = await scanInactive(guild, DEFAULT_INACTIVITY_DAYS, DEFAULT_MIN_VC_MINUTES, null);
-      console.log(`[${guild.name}] Daily scan: ${res.length} candidates (dry run).`);
+      const days = DEFAULT_INACTIVITY_DAYS;
+      const list = await scanInactive(guild, days, DEFAULT_MIN_VC_MINUTES, null);
+      const total = list.length;
+      const sample = list.slice(0, 20).map(u => `<@${u.id}>`).join(', ');
+      const more = total > 20 ? `, +${total - 20} more` : '';
+
+      const line =
+        `⏰ Daily inactive scan (last **${days}** days)\n` +
+        `• Candidates: **${total}**\n` +
+        `• Sample: ${sample || '_None_'}${more}\n` +
+        `• Note: criteria = no messages & no VC join in window` +
+        (DEFAULT_MIN_VC_MINUTES > 0 ? ` & < ${DEFAULT_MIN_VC_MINUTES} VC mins` : ``);
+
+      const ch = await getModLogChannel(guild);
+      if (ch) {
+        await ch.send({ content: line });
+      } else {
+        console.log(`[${guild.name}] ${line.replace(/\n/g, ' ')}`);
+      }
     } catch (e) {
-      console.warn(`[${guild.id}] daily scan failed:`, e.message);
+      console.warn(`[${guild.id}] daily mod-log failed:`, e.message);
     }
   }
 }, null, true);
