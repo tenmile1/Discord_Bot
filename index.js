@@ -361,37 +361,36 @@ async function getHealthLogChannel(guild) {
   return byName;
 }
 
-// ---- Health Snapshot helpers (DB-driven) ----
+// ---- Health Snapshot helpers ----
 async function buildHealthSnapshotForGuild(guild) {
   const since = nowMs() - (24 * 60 * 60 * 1000);
+  const members = await fetchAllMembers(guild);
 
-  const textSenders = countTextSendersSince.get(guild.id, since).n || 0;
-  const vcJoins = countVcJoinsSince.get(guild.id, since).n || 0;
-  const activeUsers = countActiveUnionSince.get(guild.id, since, since).n || 0; // union of text OR vc
+  let textSenders = 0;
+  let vcJoins = 0;
 
+  for (const [, m] of members) {
+    const row = getActivityRow(guild.id, m.id);
+    if (row.last_message_at && row.last_message_at >= since) textSenders++;
+    if (row.last_vc_at && row.last_vc_at >= since) vcJoins++;
+  }
+
+  const activeUsers = textSenders;
   const needsBoost = activeUsers < 15;
 
-  const embed = new EmbedBuilder()
-    .setTitle('📊 Server Health Snapshot (last 24h)')
-    .setDescription('ahoy you sea dwelling studiers! Let\'s see how many people sailed the oceanside seas today 🏴‍☠️')
-    .addFields(
-      { name: 'Active users (proxy)', value: `**${activeUsers}**`, inline: true },
-      { name: 'Text senders', value: `**${textSenders}**`, inline: true },
-      { name: 'VC joins', value: `**${vcJoins}**`, inline: true }
-    )
-    .setFooter({ text: 'Cutoff for “needs boost”: < 15 active users' })
-    .setTimestamp(new Date());
+  // no embed — just text now
+  const message = 
+    `ahoy you sea dwelling studiers! let's see who sailed the oceanside seas today 🏴‍☠️\n\n` +
+    `Active users last 24h: **${activeUsers}**\n` +
+    `Text senders: **${textSenders}**\n` +
+    `VC joins: **${vcJoins}**`;
 
-  const preface = needsBoost
-    ? '⚠️ **Activity looks low today (<15 active users).** Consider posting a prompt or hosting a quick study VC!'
-    : '✅ **Looks healthy!** Keep the momentum going.';
-
-  return { embed, preface, activeUsers, textSenders, vcJoins, needsBoost };
+  return { message };
 }
 
 async function postHealthSnapshot(guild, channel) {
-  const { embed, preface } = await buildHealthSnapshotForGuild(guild);
-  await channel.send({ content: preface, embeds: [embed] });
+  const { message } = await buildHealthSnapshotForGuild(guild);
+  await channel.send(message);
 }
 
 // ---- Events ----
