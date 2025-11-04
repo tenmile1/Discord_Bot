@@ -387,21 +387,23 @@ async function buildHealthSnapshotForGuild(guild) {
   // members cache (with best-effort fetch already attempted in fetchAllMembers)
   const members = await fetchAllMembers(guild);
 
-  let textSenders = 0;
+    let textSenders = 0;
   let vcJoins = 0;
-  let newUsersToday = 0;
+  const union = new Set();
 
   for (const [, m] of members) {
     const row = getActivityRow(guild.id, m.id);
-    if (row.last_message_at && row.last_message_at >= since24h) textSenders++;
-    if (row.last_vc_at && row.last_vc_at >= since24h) vcJoins++;
 
-    // joinedTimestamp is undefined for some partials; guard it
-    const jt = m.joinedTimestamp ?? 0;
-    if (jt && jt >= since24h) newUsersToday++;
-  }
+    const hadText = row.last_message_at && row.last_message_at >= since;
+    const hadVC   = row.last_vc_at && row.last_vc_at >= since;
 
-  const activeUsers = textSenders; // your chosen proxy
+    if (hadText) {
+      textSenders++;
+      union.add(m.id);
+    }
+    if (hadVC) {
+      vcJoins++;
+      union.ad
 
   // fun opener rotates daily
   const opener = pickDailyPirateOpener();
