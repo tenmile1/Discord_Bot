@@ -1,7 +1,14 @@
 // index.js
 require('dotenv').config();
 const {
-  Client, GatewayIntentBits, Partials, REST, Routes, PermissionsBitField, ChannelType, EmbedBuilder
+  Client,
+  GatewayIntentBits,
+  Partials,
+  REST,
+  Routes,
+  PermissionsBitField,
+  ChannelType,
+  EmbedBuilder
 } = require('discord.js');
 const Database = require('better-sqlite3');
 const cron = require('cron');
@@ -16,6 +23,8 @@ const MAX_PREVIEW = 50;
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'activity.sqlite');
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+
+// main activity table
 db.exec(`
   CREATE TABLE IF NOT EXISTS user_activity (
     guild_id TEXT NOT NULL,
@@ -27,16 +36,18 @@ db.exec(`
   )
 `);
 
-// migrations for guild_settings + optional columns
+// guild settings: include modlog + healthlog (+ chat)
 db.exec(`
   CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id TEXT PRIMARY KEY,
-    modlog_channel_id TEXT
+    modlog_channel_id TEXT,
+    healthlog_channel_id TEXT,
+    chat_channel_id TEXT
   )
 `);
-try {
-  db.exec(`ALTER TABLE guild_settings ADD COLUMN healthlog_channel_id TEXT`);
-} catch (_) { /* column already exists, ignore */ }
+// attempt to add missing columns if created earlier without them
+try { db.exec(`ALTER TABLE guild_settings ADD COLUMN healthlog_channel_id TEXT`); } catch {}
+try { db.exec(`ALTER TABLE guild_settings ADD COLUMN chat_channel_id TEXT`); } catch {}
 
 const upsertMessage = db.prepare(`
   INSERT INTO user_activity (guild_id, user_id, last_message_at)
@@ -61,18 +72,27 @@ const addVcSeconds = db.prepare(`
     last_vc_at = MAX(COALESCE(user_activity.last_vc_at, 0), excluded.last_vc_at)
 `);
 
-// ---- Guild settings helpers ----
 const setModlog = db.prepare(`
   INSERT INTO guild_settings (guild_id, modlog_channel_id)
   VALUES (?, ?)
   ON CONFLICT(guild_id) DO UPDATE SET modlog_channel_id = excluded.modlog_channel_id
 `);
-const getModlog = db.prepare(`SELECT modlog_channel_id, healthlog_channel_id FROM guild_settings WHERE guild_id = ?`);
 
 const setHealthlog = db.prepare(`
   INSERT INTO guild_settings (guild_id, healthlog_channel_id)
   VALUES (?, ?)
   ON CONFLICT(guild_id) DO UPDATE SET healthlog_channel_id = excluded.healthlog_channel_id
+`);
+
+const setChatChannel = db.prepare(`
+  INSERT INTO guild_settings (guild_id, chat_channel_id)
+  VALUES (?, ?)
+  ON CONFLICT(guild_id) DO UPDATE SET chat_channel_id = excluded.chat_channel_id
+`);
+
+const getSettings = db.prepare(`
+  SELECT modlog_channel_id, healthlog_channel_id, chat_channel_id
+  FROM guild_settings WHERE guild_id = ?
 `);
 
 // ---- Utils ----
@@ -160,13 +180,26 @@ const commands = [
   },
   {
     name: 'modlog-set',
-    description: 'Set the channel where daily inactivity reports are posted (04:00).',
-    options: [{ name: 'channel', description: 'Channel to use for inactive scan reports', type: 7, required: true }]
+    description: 'Set the channel where daily inactivity reports are posted.',
+    options: [{ name: 'channel', description: 'Channel to use for mod logs', type: 7, required: true }]
   },
   {
     name: 'healthlog-set',
-    description: 'Set the channel where the 12:30 PT Server Health Snapshot posts.',
+    description: 'Set the channel where the daily Server Health Snapshot is posted.',
     options: [{ name: 'channel', description: 'Channel to use for health snapshots', type: 7, required: true }]
+  },
+  {
+    name: 'chat-set',
+    description: 'Set the general #chat channel (fallback target).',
+    options: [{ name: 'channel', description: 'Channel to set as chat', type: 7, required: true }]
+  },
+  {
+    name: 'health-snapshot',
+    description: 'Manually run the Server Health Snapshot now.',
+    options: [
+      { name: 'channel', description: 'Override channel to post in', type: 7, required: false },
+      { name: 'dry_run', description: 'If true, show preview only (no post).', type: 5, required: false }
+    ]
   }
 ];
 
@@ -174,7 +207,10 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
   // 1) Clear GLOBAL commands to remove duplicates everywhere
-  await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: [] });
+  await rest.put(
+    Routes.applicationCommands(process.env.CLIENT_ID),
+    { body: [] }
+  );
   console.log('✓ Cleared global commands');
 
   // 2) Register GUILD commands (instant in your server)
@@ -185,7 +221,10 @@ async function registerCommands() {
     );
     console.log(`✓ Slash commands registered (guild: ${process.env.GUILD_ID})`);
   } else {
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
+    await rest.put(
+      Routes.applicationCommands(process.env.CLIENT_ID),
+      { body: commands }
+    );
     console.log('✓ Slash commands registered (global)');
   }
 }
@@ -216,9 +255,9 @@ function isInactiveByThreshold(row, cutoffMs, minVcSeconds) {
   const lm = row.last_message_at ?? 0;
   const lv = row.last_vc_at ?? 0;
   const hasRecentMessage = lm >= cutoffMs;
-  const hasRecentVC = lv >= cutoffMs;
+  theHasRecentVC = lv >= cutoffMs;
   const vcEnough = (minVcSeconds > 0) && ((row.vc_seconds_total || 0) >= minVcSeconds);
-  return !hasRecentMessage && !hasRecentVC && !vcEnough;
+  return !hasRecentMessage && !theHasRecentVC && !vcEnough;
 }
 
 async function scanInactive(guild, days = DEFAULT_INACTIVITY_DAYS, minVcMinutes = DEFAULT_MIN_VC_MINUTES, excludeRoleId = null) {
@@ -255,37 +294,89 @@ async function kickMembers(guild, userIds) {
   return kicked;
 }
 
+function getSettingsRow(guild) {
+  return getSettings.get(guild.id) || {};
+}
+
+async function getTextChannelByName(guild, nameLower) {
+  const match = guild.channels.cache.find(ch =>
+    ch?.isTextBased?.() && ch?.viewable && ch.name?.toLowerCase() === nameLower
+  );
+  return match || null;
+}
+
 async function getModLogChannel(guild) {
-  const row = getModlog.get(guild.id);
-  const idFromDb = row?.modlog_channel_id;
-  const idFromEnv = process.env.MOD_LOG_CHANNEL_ID; // optional fallback for all guilds
+  const s = getSettingsRow(guild);
+  const idFromDb = s.modlog_channel_id;
+  const idFromEnv = process.env.MOD_LOG_CHANNEL_ID || null;
   const channelId = idFromDb || idFromEnv;
-  if (!channelId) return null;
-  try {
-    const ch = await guild.channels.fetch(channelId);
-    if (!ch || !ch.isTextBased?.() || !ch.viewable) return null;
-    return ch;
-  } catch {
-    return null;
+  if (channelId) {
+    try {
+      const ch = await guild.channels.fetch(channelId);
+      if (ch?.isTextBased?.() && ch.viewable) return ch;
+    } catch {}
   }
+  return null;
 }
 
 async function getHealthLogChannel(guild) {
-  const row = getModlog.get(guild.id);
-  const idFromDb = row?.healthlog_channel_id;
-  const idFromEnv = process.env.HEALTH_LOG_CHANNEL_ID; // optional fallback
-  const channelId = idFromDb || idFromEnv;
-  if (!channelId) return null;
-  try {
-    const ch = await guild.channels.fetch(channelId);
-    if (!ch || !ch.isTextBased?.() || !ch.viewable) return null;
-    return ch;
-  } catch {
-    return null;
+  const s = getSettingsRow(guild);
+  const idFromDb = s.healthlog_channel_id || s.chat_channel_id || null;
+  const idFromEnv = process.env.HEALTH_LOG_CHANNEL_ID || process.env.CHAT_CHANNEL_ID || null;
+
+  if (idFromDb || idFromEnv) {
+    const pick = idFromDb || idFromEnv;
+    try {
+      const ch = await guild.channels.fetch(pick);
+      if (ch?.isTextBased?.() && ch.viewable) return ch;
+    } catch {}
   }
+  // fallback by name: "chat"
+  const byName = await getTextChannelByName(guild, 'chat');
+  return byName;
 }
 
-// ---- Events: activity tracking ----
+// ---- Health Snapshot helpers ----
+async function buildHealthSnapshotForGuild(guild) {
+  const since = nowMs() - (24 * 60 * 60 * 1000);
+  const members = await fetchAllMembers(guild);
+
+  let textSenders = 0;
+  let vcJoins = 0;
+
+  for (const [, m] of members) {
+    const row = getActivityRow(guild.id, m.id);
+    if (row.last_message_at && row.last_message_at >= since) textSenders++;
+    if (row.last_vc_at && row.last_vc_at >= since) vcJoins++;
+  }
+
+  const activeUsers = textSenders; // proxy for "active"
+  const needsBoost = activeUsers < 15;
+
+  const embed = new EmbedBuilder()
+    .setTitle('📊 Server Health Snapshot (last 24h)')
+    .setDescription('ahoy you sea dwelling studiers! Let\'s see how many people sailed the oceanside seas today 🏴‍☠️')
+    .addFields(
+      { name: 'Active users (proxy)', value: `**${activeUsers}**`, inline: true },
+      { name: 'Text senders', value: `**${textSenders}**`, inline: true },
+      { name: 'VC joins', value: `**${vcJoins}**`, inline: true }
+    )
+    .setFooter({ text: 'Cutoff for “needs boost”: < 15 active users' })
+    .setTimestamp(new Date());
+
+  const preface = needsBoost
+    ? '⚠️ **Activity looks low today (<15 active users).** Consider posting a prompt or hosting a quick study VC!'
+    : '✅ **Looks healthy!** Keep the momentum going.';
+
+  return { embed, preface, activeUsers, textSenders, vcJoins, needsBoost };
+}
+
+async function postHealthSnapshot(guild, channel) {
+  const { embed, preface } = await buildHealthSnapshotForGuild(guild);
+  await channel.send({ content: preface, embeds: [embed] });
+}
+
+// ---- Events ----
 client.on('messageCreate', (msg) => {
   if (!msg.guild || msg.author.bot) return;
   try {
@@ -306,9 +397,11 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 
   try {
     if (!wasIn && isIn) {
+      // joined VC
       activeVcSessions.set(key, now);
       upsertVcJoin.run({ guild_id: guildId, user_id: userId, ts: now });
     } else if (wasIn && !isIn) {
+      // left VC
       const start = activeVcSessions.get(key);
       if (start) {
         const delta = Math.max(0, Math.floor((now - start) / 1000));
@@ -316,6 +409,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         activeVcSessions.delete(key);
       }
     } else if (wasIn && isIn && oldState.channelId !== newState.channelId) {
+      // moved VC
       const start = activeVcSessions.get(key);
       if (start) {
         const delta = Math.max(0, Math.floor((now - start) / 1000));
@@ -329,16 +423,22 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   }
 });
 
-// ---- Commands ----
 client.on('interactionCreate', async (interaction) => {
   try {
     if (!interaction.isChatInputCommand()) return;
 
     const guild = interaction.guild;
-    if (!guild) return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
+    if (!guild) {
+      return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
+    }
 
-    // gatekeeper: mod perms
-    if (['inactive-scan','inactive-kick','hydrate-history','debug-activity','modlog-set','healthlog-set'].includes(interaction.commandName)) {
+    // gatekeeper: mod perms for these commands
+    if ([
+      'inactive-scan', 'inactive-kick',
+      'hydrate-history', 'debug-activity',
+      'modlog-set', 'healthlog-set', 'chat-set',
+      'health-snapshot'
+    ].includes(interaction.commandName)) {
       if (!interaction.memberPermissions.has(PermissionsBitField.Flags.KickMembers)) {
         return interaction.reply({ content: 'You need **Kick Members** permission to use this.', ephemeral: true });
       }
@@ -586,8 +686,13 @@ client.on('interactionCreate', async (interaction) => {
       if (!channel?.isTextBased?.() || !channel.viewable) {
         return interaction.reply({ content: 'Please choose a text channel I can see.', ephemeral: true });
       }
-      setModlog.run(interaction.guild.id, channel.id);
-      return interaction.reply({ content: `Inactive-scan reports will post to ${channel}.`, ephemeral: true });
+      try {
+        setModlog.run(interaction.guild.id, channel.id);
+        await interaction.reply({ content: `Mod-log channel set to ${channel}.`, ephemeral: true });
+      } catch (e) {
+        await interaction.reply({ content: `Failed to save: ${e.message}`, ephemeral: true });
+      }
+      return;
     }
 
     // /healthlog-set
@@ -599,8 +704,66 @@ client.on('interactionCreate', async (interaction) => {
       if (!channel?.isTextBased?.() || !channel.viewable) {
         return interaction.reply({ content: 'Please choose a text channel I can see.', ephemeral: true });
       }
-      setHealthlog.run(interaction.guild.id, channel.id);
-      return interaction.reply({ content: `Server Health Snapshots will post to ${channel} at 12:30 PT.`, ephemeral: true });
+      try {
+        setHealthlog.run(interaction.guild.id, channel.id);
+        await interaction.reply({ content: `Health-log channel set to ${channel}.`, ephemeral: true });
+      } catch (e) {
+        await interaction.reply({ content: `Failed to save: ${e.message}`, ephemeral: true });
+      }
+      return;
+    }
+
+    // /chat-set (optional explicit #chat picker)
+    if (interaction.commandName === 'chat-set') {
+      if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild)) {
+        return interaction.reply({ content: 'You need **Manage Server** to run this.', ephemeral: true });
+      }
+      const channel = interaction.options.getChannel('channel');
+      if (!channel?.isTextBased?.() || !channel.viewable) {
+        return interaction.reply({ content: 'Please choose a text channel I can see.', ephemeral: true });
+      }
+      try {
+        setChatChannel.run(interaction.guild.id, channel.id);
+        await interaction.reply({ content: `Chat channel set to ${channel}.`, ephemeral: true });
+      } catch (e) {
+        await interaction.reply({ content: `Failed to save: ${e.message}`, ephemeral: true });
+      }
+      return;
+    }
+
+    // /health-snapshot (manual)
+    if (interaction.commandName === 'health-snapshot') {
+      const overrideChannel = interaction.options.getChannel('channel');
+      const dryRun = interaction.options.getBoolean('dry_run') ?? false;
+
+      await interaction.deferReply({ ephemeral: true });
+
+      let target = overrideChannel;
+      if (!target) target = await getHealthLogChannel(interaction.guild);
+      if (!target) {
+        return interaction.editReply('No health-log channel set. Use **/healthlog-set** or pass a **channel** override.');
+      }
+      if (!target.isTextBased?.() || !target.viewable) {
+        return interaction.editReply('I cannot post in that channel (not text-based or not viewable).');
+      }
+
+      const snap = await buildHealthSnapshotForGuild(interaction.guild);
+
+      if (dryRun) {
+        return interaction.editReply(
+          [
+            '🧪 **Health Snapshot (dry run)**',
+            `Active users (proxy): **${snap.activeUsers}**`,
+            `Text senders: **${snap.textSenders}**`,
+            `VC joins: **${snap.vcJoins}**`,
+            `Needs boost (<15): **${snap.needsBoost ? 'Yes' : 'No'}**`,
+            `Target channel: ${target}`
+          ].join('\n')
+        );
+      }
+
+      await postHealthSnapshot(interaction.guild, target);
+      return interaction.editReply(`✅ Posted health snapshot to ${target}.`);
     }
 
   } catch (e) {
@@ -615,7 +778,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// --- Scheduled: Daily 04:00 inactive scan -> mod-log channel ---
+// --- Scheduled: Daily 04:00 PT inactive report to mod-log AND health/chat channel ---
 new cron.CronJob('0 4 * * *', async () => {
   for (const [, guild] of client.guilds.cache) {
     try {
@@ -632,67 +795,35 @@ new cron.CronJob('0 4 * * *', async () => {
         `• Note: criteria = no messages & no VC join in window` +
         (DEFAULT_MIN_VC_MINUTES > 0 ? ` & < ${DEFAULT_MIN_VC_MINUTES} VC mins` : ``);
 
-      const ch = await getModLogChannel(guild);
-      if (ch) await ch.send({ content: line });
-      else console.log(`[${guild.name}] ${line.replace(/\n/g, ' ')}`);
+      const modCh = await getModLogChannel(guild);
+      const healthCh = await getHealthLogChannel(guild);
+
+      if (modCh) await modCh.send({ content: line });
+      if (healthCh && (!modCh || healthCh.id !== modCh.id)) await healthCh.send({ content: line });
+      if (!modCh && !healthCh) console.log(`[${guild.name}] ${line.replace(/\n/g, ' ')}`);
     } catch (e) {
-      console.warn(`[${guild.id}] daily mod-log failed:`, e.message);
+      console.warn(`[${guild.id}] daily inactive report failed:`, e.message);
     }
   }
 }, null, true, 'America/Los_Angeles');
 
-// --- Scheduled: Daily 12:30 PT Server Health Snapshot -> health-log channel ---
+// --- Scheduled: Daily 12:30 PT Server Health Snapshot to health/chat channel ---
 new cron.CronJob('30 12 * * *', async () => {
   for (const [, guild] of client.guilds.cache) {
     try {
-      const ch = await getHealthLogChannel(guild);
-      if (!ch) continue;
-
-      // Gather snapshot
-      const members = await fetchAllMembers(guild);
-      let textSenders = 0;
-      let textMsgs = 0;
-      let vcJoins = 0;
-
-      // Count last 24h text senders/messages from stored activity (approximate: last_message_at)
-      const since = nowMs() - (24 * 60 * 60 * 1000);
-      for (const [, m] of members) {
-        const row = getActivityRow(guild.id, m.id);
-        if (row.last_message_at && row.last_message_at >= since) {
-          textSenders++;
-          textMsgs++; // we don't track counts; treat as at least 1 per sender for headline
-        }
-        if (row.last_vc_at && row.last_vc_at >= since) vcJoins++;
+      const target = await getHealthLogChannel(guild);
+      if (!target) {
+        console.log(`[${guild.name}] No health/chat channel found for health snapshot.`);
+        continue;
       }
-
-      const activeUsers = textSenders; // proxy for "active today"
-      const needsBoost = activeUsers < 15;
-
-      const embed = new EmbedBuilder()
-        .setTitle('📊 Server Health Snapshot (last 24h)')
-        .setDescription(
-          'ahoy you sea dwelling studiers! Let\'s see how many people sailed the oceanside seas today 🏴‍☠️'
-        )
-        .addFields(
-          { name: 'Active users (proxy)', value: `**${activeUsers}**`, inline: true },
-          { name: 'Text senders', value: `**${textSenders}**`, inline: true },
-          { name: 'VC joins', value: `**${vcJoins}**`, inline: true }
-        )
-        .setFooter({ text: `Cutoff for “needs boost”: < 15 active users` })
-        .setTimestamp(new Date());
-
-      const preface = needsBoost
-        ? '⚠️ **Activity looks low today (<15 active users).** Consider posting a prompt or hosting a quick study VC!'
-        : '✅ **Looks healthy!** Keep the momentum going.';
-
-      await ch.send({ content: preface, embeds: [embed] });
+      await postHealthSnapshot(guild, target);
     } catch (e) {
       console.warn(`[${guild.id}] health snapshot failed:`, e.message);
     }
   }
 }, null, true, 'America/Los_Angeles');
 
-// Use clientReady (to avoid the deprecation warning you saw)
+// Use clientReady (future-proof the ready event name)
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   try {
