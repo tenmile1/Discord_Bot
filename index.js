@@ -381,7 +381,7 @@ async function buildHealthSnapshotForGuild(guild) {
   // no embed — just text now
   const message = 
     `ahoy you sea dwelling studiers! let's see who sailed the oceanside seas today 🏴‍☠️\n\n` +
-    `Active users last 24h: **${activeUsers}**\n` +
+    `Active users: **${activeUsers}**\n` +
     `Text senders: **${textSenders}**\n` +
     `VC joins: **${vcJoins}**`;
 
