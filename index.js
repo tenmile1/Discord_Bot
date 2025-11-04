@@ -384,18 +384,21 @@ async function getHealthLogChannel(guild) {
 async function buildHealthSnapshotForGuild(guild) {
   const since24h = nowMs() - (24 * 60 * 60 * 1000);
 
-  // members cache (with best-effort fetch already attempted in fetchAllMembers)
-  const members = await fetchAllMembers(guild);
+  // Try to populate member cache (best effort)
+  try { await guild.members.fetch({ withPresences: false, time: 10_000 }); } catch {}
 
-    let textSenders = 0;
+  const members = guild.members.cache;
+
+  let textSenders = 0;
   let vcJoins = 0;
+  let newMembers = 0;
   const union = new Set();
 
   for (const [, m] of members) {
     const row = getActivityRow(guild.id, m.id);
 
-    const hadText = row.last_message_at && row.last_message_at >= since;
-    const hadVC   = row.last_vc_at && row.last_vc_at >= since;
+    const hadText = !!row.last_message_at && row.last_message_at >= since24h;
+    const hadVC   = !!row.last_vc_at     && row.last_vc_at     >= since24h;
 
     if (hadText) {
       textSenders++;
@@ -405,28 +408,35 @@ async function buildHealthSnapshotForGuild(guild) {
       vcJoins++;
       union.add(m.id);
     }
-}
 
-const activeUsers = union.size; // union of text OR VC
+    if (m.joinedTimestamp && m.joinedTimestamp >= since24h) {
+      newMembers++;
+    }
+  }
 
-  // fun opener rotates daily
-  const opener = pickDailyPirateOpener();
+  const activeUsers = union.size; // union of text OR VC in last 24h
 
-  const lines = [
-    opener,
-    "",
-    `Active users last 24h: **${activeUsers}**`,
-    `Text senders: **${textSenders}**`,
-    `VC joins: **${vcJoins}**`,
-    `New users today: **${newUsersToday}**`
+  // rotate fun openers
+  const openers = [
+    "ahoy you sea dwelling studiers! Let's see how many people sailed the oceanside seas today",
+    "batten down the hatches—today’s study seas be choppy!",
+    "trim the sails, mates! here’s today’s voyage across the chat waters",
+    "anchors aweigh! daily headcount of our studious crew coming right up"
   ];
+  const opener = openers[Math.floor(Math.random() * openers.length)];
 
-  return { message: lines.join('\n') };
+  // plain-text message (no embeds)
+  const message =
+    `${opener}\n` +
+    `Active users (24h): **${activeUsers}**\n` +
+    `Text senders: **${textSenders}** | VC joins: **${vcJoins}** | New members: **${newMembers}**`;
+
+  return { activeUsers, textSenders, vcJoins, newMembers, message };
 }
 
 async function postHealthSnapshot(guild, channel) {
   const { message } = await buildHealthSnapshotForGuild(guild);
-  await channel.send(message);
+  await channel.send({ content: message });
 }
 
 // ---- Events ----
