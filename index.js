@@ -121,6 +121,22 @@ function nowMs() { return Date.now(); }
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 function msFromDays(days) { return days * 24 * 60 * 60 * 1000; }
 
+// Pick a daily-rotating pirate message (stable within a day)
+function pickDailyPirateOpener() {
+  const lines = [
+    "ahoy you sea dwelling studiers! let's see who sailed the oceanside seas today 🏴‍☠️",
+    "avast ye scholars! who braved the waves o’ wisdom today? ☠️",
+    "hoist the mainsail, study crew—time to tally today’s voyages! 🦜",
+    "batten down the books! who charted the learning seas today? 🗺️",
+    "anchors aweigh, academics—today’s voyage log be here! ⚓"
+  ];
+  // stable index for the day to avoid spammy randomness
+  const d = new Date();
+  const seed = Number(`${d.getUTCFullYear()}${d.getUTCMonth()+1}${d.getUTCDate()}`); // yyyymmdd
+  const idx = seed % lines.length;
+  return lines[idx];
+}
+
 // ---- Track active VC sessions in memory ----
 const activeVcSessions = new Map(); // key: `${guildId}:${userId}` -> joinTimestampMs
 
@@ -260,10 +276,12 @@ function memberIsProtected(member) {
 }
 
 async function fetchAllMembers(guild) {
+  const timeoutMs = Number(process.env.FETCH_MEMBERS_TIMEOUT_MS || 15000);
   try {
-    await guild.members.fetch({ time: 120000 });
+    // Try to populate the cache; if it times out, we catch and use whatever we have.
+    await guild.members.fetch({ time: timeoutMs });
   } catch (e) {
-    console.warn(`[${guild.id}] members.fetch timeout/failure; using cache only: ${e?.message || e}`);
+    console.warn(`[${guild.id}] members.fetch timeout/failure; using cache only: ${e.message}`);
   }
   return guild.members.cache;
 }
@@ -362,30 +380,42 @@ async function getHealthLogChannel(guild) {
 }
 
 // ---- Health Snapshot helpers ----
+// ---- Health Snapshot helpers (replace both functions) ----
 async function buildHealthSnapshotForGuild(guild) {
-  const since = nowMs() - (24 * 60 * 60 * 1000);
+  const since24h = nowMs() - (24 * 60 * 60 * 1000);
+
+  // members cache (with best-effort fetch already attempted in fetchAllMembers)
   const members = await fetchAllMembers(guild);
 
   let textSenders = 0;
   let vcJoins = 0;
+  let newUsersToday = 0;
 
   for (const [, m] of members) {
     const row = getActivityRow(guild.id, m.id);
-    if (row.last_message_at && row.last_message_at >= since) textSenders++;
-    if (row.last_vc_at && row.last_vc_at >= since) vcJoins++;
+    if (row.last_message_at && row.last_message_at >= since24h) textSenders++;
+    if (row.last_vc_at && row.last_vc_at >= since24h) vcJoins++;
+
+    // joinedTimestamp is undefined for some partials; guard it
+    const jt = m.joinedTimestamp ?? 0;
+    if (jt && jt >= since24h) newUsersToday++;
   }
 
-  const activeUsers = textSenders;
-  const needsBoost = activeUsers < 15;
+  const activeUsers = textSenders; // your chosen proxy
 
-  // no embed — just text now
-  const message = 
-    `ahoy you sea dwelling studiers! let's see who sailed the oceanside seas today 🏴‍☠️\n\n` +
-    `Active users: **${activeUsers}**\n` +
-    `Text senders: **${textSenders}**\n` +
-    `VC joins: **${vcJoins}**`;
+  // fun opener rotates daily
+  const opener = pickDailyPirateOpener();
 
-  return { message };
+  const lines = [
+    opener,
+    "",
+    `Active users last 24h: **${activeUsers}**`,
+    `Text senders: **${textSenders}**`,
+    `VC joins: **${vcJoins}**`,
+    `New users today: **${newUsersToday}**`
+  ];
+
+  return { message: lines.join('\n') };
 }
 
 async function postHealthSnapshot(guild, channel) {
