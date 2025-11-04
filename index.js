@@ -440,7 +440,7 @@ async function buildHealthSnapshotForGuild(guild) {
 
 
   // Plaintext message line (no header, no cutoff text)
-  const content = `${opener}\n${vibe}`;
+  const content = opener;
 
   return { content, embed };
 }
