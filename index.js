@@ -8,7 +8,8 @@ const {
   Routes,
   PermissionsBitField,
   ChannelType,
-  EmbedBuilder
+  EmbedBuilder,
+  MessageFlags
 } = require('discord.js');
 const Database = require('better-sqlite3');
 const cron = require('cron');
@@ -45,10 +46,10 @@ db.exec(`
     chat_channel_id TEXT
   )
 `);
-// attempt to add missing columns if created earlier without them
 try { db.exec(`ALTER TABLE guild_settings ADD COLUMN healthlog_channel_id TEXT`); } catch {}
 try { db.exec(`ALTER TABLE guild_settings ADD COLUMN chat_channel_id TEXT`); } catch {}
 
+// activity upserts
 const upsertMessage = db.prepare(`
   INSERT INTO user_activity (guild_id, user_id, last_message_at)
   VALUES (@guild_id, @user_id, @ts)
@@ -72,6 +73,7 @@ const addVcSeconds = db.prepare(`
     last_vc_at = MAX(COALESCE(user_activity.last_vc_at, 0), excluded.last_vc_at)
 `);
 
+// guild setting statements
 const setModlog = db.prepare(`
   INSERT INTO guild_settings (guild_id, modlog_channel_id)
   VALUES (?, ?)
@@ -93,6 +95,25 @@ const setChatChannel = db.prepare(`
 const getSettings = db.prepare(`
   SELECT modlog_channel_id, healthlog_channel_id, chat_channel_id
   FROM guild_settings WHERE guild_id = ?
+`);
+
+// ---- Activity counting for Health Snapshot (DB-driven) ----
+const countActiveUnionSince = db.prepare(`
+  SELECT COUNT(*) AS n
+  FROM user_activity
+  WHERE guild_id = ? AND (last_message_at >= ? OR last_vc_at >= ?)
+`);
+
+const countTextSendersSince = db.prepare(`
+  SELECT COUNT(*) AS n
+  FROM user_activity
+  WHERE guild_id = ? AND last_message_at >= ?
+`);
+
+const countVcJoinsSince = db.prepare(`
+  SELECT COUNT(*) AS n
+  FROM user_activity
+  WHERE guild_id = ? AND last_vc_at >= ?
 `);
 
 // ---- Utils ----
@@ -239,7 +260,11 @@ function memberIsProtected(member) {
 }
 
 async function fetchAllMembers(guild) {
-  await guild.members.fetch();
+  try {
+    await guild.members.fetch({ time: 120000 });
+  } catch (e) {
+    console.warn(`[${guild.id}] members.fetch timeout/failure; using cache only: ${e?.message || e}`);
+  }
   return guild.members.cache;
 }
 
@@ -255,9 +280,9 @@ function isInactiveByThreshold(row, cutoffMs, minVcSeconds) {
   const lm = row.last_message_at ?? 0;
   const lv = row.last_vc_at ?? 0;
   const hasRecentMessage = lm >= cutoffMs;
-  theHasRecentVC = lv >= cutoffMs;
+  const hasRecentVC = lv >= cutoffMs;
   const vcEnough = (minVcSeconds > 0) && ((row.vc_seconds_total || 0) >= minVcSeconds);
-  return !hasRecentMessage && !theHasRecentVC && !vcEnough;
+  return !hasRecentMessage && !hasRecentVC && !vcEnough;
 }
 
 async function scanInactive(guild, days = DEFAULT_INACTIVITY_DAYS, minVcMinutes = DEFAULT_MIN_VC_MINUTES, excludeRoleId = null) {
@@ -336,21 +361,14 @@ async function getHealthLogChannel(guild) {
   return byName;
 }
 
-// ---- Health Snapshot helpers ----
+// ---- Health Snapshot helpers (DB-driven) ----
 async function buildHealthSnapshotForGuild(guild) {
   const since = nowMs() - (24 * 60 * 60 * 1000);
-  const members = await fetchAllMembers(guild);
 
-  let textSenders = 0;
-  let vcJoins = 0;
+  const textSenders = countTextSendersSince.get(guild.id, since).n || 0;
+  const vcJoins = countVcJoinsSince.get(guild.id, since).n || 0;
+  const activeUsers = countActiveUnionSince.get(guild.id, since, since).n || 0; // union of text OR vc
 
-  for (const [, m] of members) {
-    const row = getActivityRow(guild.id, m.id);
-    if (row.last_message_at && row.last_message_at >= since) textSenders++;
-    if (row.last_vc_at && row.last_vc_at >= since) vcJoins++;
-  }
-
-  const activeUsers = textSenders; // proxy for "active"
   const needsBoost = activeUsers < 15;
 
   const embed = new EmbedBuilder()
@@ -429,7 +447,7 @@ client.on('interactionCreate', async (interaction) => {
 
     const guild = interaction.guild;
     if (!guild) {
-      return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
+      return interaction.reply({ content: 'Use this in a server.', flags: MessageFlags.Ephemeral });
     }
 
     // gatekeeper: mod perms for these commands
@@ -437,10 +455,10 @@ client.on('interactionCreate', async (interaction) => {
       'inactive-scan', 'inactive-kick',
       'hydrate-history', 'debug-activity',
       'modlog-set', 'healthlog-set', 'chat-set',
-      'health-snapshot'
+      'health-snapshot', 'peek-channel', 'debug-channel'
     ].includes(interaction.commandName)) {
       if (!interaction.memberPermissions.has(PermissionsBitField.Flags.KickMembers)) {
-        return interaction.reply({ content: 'You need **Kick Members** permission to use this.', ephemeral: true });
+        return interaction.reply({ content: 'You need **Kick Members** permission to use this.', flags: MessageFlags.Ephemeral });
       }
     }
 
@@ -450,7 +468,7 @@ client.on('interactionCreate', async (interaction) => {
       const minVcMinutes = interaction.options.getInteger('min_vc_minutes') ?? DEFAULT_MIN_VC_MINUTES;
       const excludeRole = interaction.options.getRole('exclude_role');
 
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       const list = await scanInactive(guild, days, minVcMinutes, excludeRole?.id ?? null);
       const sample = list.slice(0, MAX_PREVIEW).map(u => `<@${u.id}>`).join(', ');
@@ -468,14 +486,14 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'inactive-kick') {
       const confirm = (interaction.options.getString('confirm') || '').toLowerCase().trim();
       if (confirm !== 'true') {
-        return interaction.reply({ content: 'Type `true` in the `confirm` option to proceed.', ephemeral: true });
+        return interaction.reply({ content: 'Type `true` in the `confirm` option to proceed.', flags: MessageFlags.Ephemeral });
       }
 
       const days = interaction.options.getInteger('days') ?? DEFAULT_INACTIVITY_DAYS;
       const minVcMinutes = interaction.options.getInteger('min_vc_minutes') ?? DEFAULT_MIN_VC_MINUTES;
       const excludeRole = interaction.options.getRole('exclude_role');
 
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       const list = await scanInactive(guild, days, minVcMinutes, excludeRole?.id ?? null);
       const ids = list.map(u => u.id);
@@ -488,7 +506,7 @@ client.on('interactionCreate', async (interaction) => {
     // /hydrate-history
     if (interaction.commandName === 'hydrate-history') {
       if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild)) {
-        return interaction.reply({ content: 'You need **Manage Server** to run this.', ephemeral: true });
+        return interaction.reply({ content: 'You need **Manage Server** to run this.', flags: MessageFlags.Ephemeral });
       }
 
       const days = interaction.options.getInteger('days') ?? 90;
@@ -503,7 +521,7 @@ client.on('interactionCreate', async (interaction) => {
         content: `Hydrate starting (≤${days}d, up to ${perChannelLimit} msgs/channel)` +
                  (targetChannel ? ` on ${targetChannel}` : ` on all visible text channels`) +
                  (includeThreads ? ` + threads` : ``) + `…`,
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
 
       let channelsScanned = 0, messagesScanned = 0, usersTouched = 0;
@@ -592,7 +610,7 @@ client.on('interactionCreate', async (interaction) => {
           `• Messages scanned: ${messagesScanned}\n` +
           `• Users updated: ~${usersTouched}\n` +
           (targetChannel ? `• Channel: ${targetChannel}` : ''),
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
       return;
     }
@@ -608,17 +626,17 @@ client.on('interactionCreate', async (interaction) => {
       const canRead = !!perms && perms.has(PermissionsBitField.Flags.ReadMessageHistory);
 
       if (!canView || !canRead || !ch.messages?.fetch) {
-        return interaction.reply({ content: 'I cannot read messages in that channel.', ephemeral: true });
+        return interaction.reply({ content: 'I cannot read messages in that channel.', flags: MessageFlags.Ephemeral });
       }
 
       let batch;
       try {
         batch = await ch.messages.fetch({ limit: lim });
       } catch (e) {
-        return interaction.reply({ content: `Fetch failed: ${e.message}`, ephemeral: true });
+        return interaction.reply({ content: `Fetch failed: ${e.message}`, flags: MessageFlags.Ephemeral });
       }
       if (!batch || batch.size === 0) {
-        return interaction.reply({ content: 'No messages returned.', ephemeral: true });
+        return interaction.reply({ content: 'No messages returned.', flags: MessageFlags.Ephemeral });
       }
 
       const lines = [];
@@ -633,7 +651,7 @@ client.on('interactionCreate', async (interaction) => {
 
       await interaction.reply({
         content: `Last ${lines.length} messages in ${ch}:\n` + lines.join('\n'),
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
       return;
     }
@@ -656,7 +674,7 @@ client.on('interactionCreate', async (interaction) => {
           `perms(ViewChannel): ${canView}\n` +
           `perms(ReadMessageHistory): ${canReadHist}\n` +
           `perms(SendMessages): ${canSend}`,
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
       return;
     }
@@ -672,7 +690,7 @@ client.on('interactionCreate', async (interaction) => {
           `last_message_at: ${toDate(row.last_message_at)}\n` +
           `last_vc_at:     ${toDate(row.last_vc_at)}\n` +
           `vc_seconds_total: ${row.vc_seconds_total || 0}`,
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
       return;
     }
@@ -680,17 +698,17 @@ client.on('interactionCreate', async (interaction) => {
     // /modlog-set
     if (interaction.commandName === 'modlog-set') {
       if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild)) {
-        return interaction.reply({ content: 'You need **Manage Server** to run this.', ephemeral: true });
+        return interaction.reply({ content: 'You need **Manage Server** to run this.', flags: MessageFlags.Ephemeral });
       }
       const channel = interaction.options.getChannel('channel');
       if (!channel?.isTextBased?.() || !channel.viewable) {
-        return interaction.reply({ content: 'Please choose a text channel I can see.', ephemeral: true });
+        return interaction.reply({ content: 'Please choose a text channel I can see.', flags: MessageFlags.Ephemeral });
       }
       try {
         setModlog.run(interaction.guild.id, channel.id);
-        await interaction.reply({ content: `Mod-log channel set to ${channel}.`, ephemeral: true });
+        await interaction.reply({ content: `Mod-log channel set to ${channel}.`, flags: MessageFlags.Ephemeral });
       } catch (e) {
-        await interaction.reply({ content: `Failed to save: ${e.message}`, ephemeral: true });
+        await interaction.reply({ content: `Failed to save: ${e.message}`, flags: MessageFlags.Ephemeral });
       }
       return;
     }
@@ -698,35 +716,35 @@ client.on('interactionCreate', async (interaction) => {
     // /healthlog-set
     if (interaction.commandName === 'healthlog-set') {
       if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild)) {
-        return interaction.reply({ content: 'You need **Manage Server** to run this.', ephemeral: true });
+        return interaction.reply({ content: 'You need **Manage Server** to run this.', flags: MessageFlags.Ephemeral });
       }
       const channel = interaction.options.getChannel('channel');
       if (!channel?.isTextBased?.() || !channel.viewable) {
-        return interaction.reply({ content: 'Please choose a text channel I can see.', ephemeral: true });
+        return interaction.reply({ content: 'Please choose a text channel I can see.', flags: MessageFlags.Ephemeral });
       }
       try {
         setHealthlog.run(interaction.guild.id, channel.id);
-        await interaction.reply({ content: `Health-log channel set to ${channel}.`, ephemeral: true });
+        await interaction.reply({ content: `Health-log channel set to ${channel}.`, flags: MessageFlags.Ephemeral });
       } catch (e) {
-        await interaction.reply({ content: `Failed to save: ${e.message}`, ephemeral: true });
+        await interaction.reply({ content: `Failed to save: ${e.message}`, flags: MessageFlags.Ephemeral });
       }
       return;
     }
 
-    // /chat-set (optional explicit #chat picker)
+    // /chat-set
     if (interaction.commandName === 'chat-set') {
       if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild)) {
-        return interaction.reply({ content: 'You need **Manage Server** to run this.', ephemeral: true });
+        return interaction.reply({ content: 'You need **Manage Server** to run this.', flags: MessageFlags.Ephemeral });
       }
       const channel = interaction.options.getChannel('channel');
       if (!channel?.isTextBased?.() || !channel.viewable) {
-        return interaction.reply({ content: 'Please choose a text channel I can see.', ephemeral: true });
+        return interaction.reply({ content: 'Please choose a text channel I can see.', flags: MessageFlags.Ephemeral });
       }
       try {
         setChatChannel.run(interaction.guild.id, channel.id);
-        await interaction.reply({ content: `Chat channel set to ${channel}.`, ephemeral: true });
+        await interaction.reply({ content: `Chat channel set to ${channel}.`, flags: MessageFlags.Ephemeral });
       } catch (e) {
-        await interaction.reply({ content: `Failed to save: ${e.message}`, ephemeral: true });
+        await interaction.reply({ content: `Failed to save: ${e.message}`, flags: MessageFlags.Ephemeral });
       }
       return;
     }
@@ -736,7 +754,7 @@ client.on('interactionCreate', async (interaction) => {
       const overrideChannel = interaction.options.getChannel('channel');
       const dryRun = interaction.options.getBoolean('dry_run') ?? false;
 
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       let target = overrideChannel;
       if (!target) target = await getHealthLogChannel(interaction.guild);
@@ -772,7 +790,7 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply('Something went wrong. Check permissions and try again.');
       } else {
-        await interaction.reply({ content: 'Something went wrong. Check permissions and try again.', ephemeral: true });
+        await interaction.reply({ content: 'Something went wrong. Check permissions and try again.', flags: MessageFlags.Ephemeral });
       }
     } catch {}
   }
