@@ -380,63 +380,75 @@ async function getHealthLogChannel(guild) {
 }
 
 // ---- Health Snapshot helpers ----
-// ---- Health Snapshot helpers (replace both functions) ----
+// ---- Health Snapshot helpers (HYBRID: pirate line + minimal embed) ----
 async function buildHealthSnapshotForGuild(guild) {
   const since24h = nowMs() - (24 * 60 * 60 * 1000);
 
-  // Try to populate member cache (best effort)
-  try { await guild.members.fetch({ withPresences: false, time: 10_000 }); } catch {}
-
-  const members = guild.members.cache;
+  // Best-effort member cache (won't blow up if it times out)
+  let members;
+  try {
+    members = await fetchAllMembers(guild);
+  } catch {
+    members = guild.members.cache;
+  }
 
   let textSenders = 0;
   let vcJoins = 0;
-  let newMembers = 0;
   const union = new Set();
 
   for (const [, m] of members) {
     const row = getActivityRow(guild.id, m.id);
+    const hadText = !!(row.last_message_at && row.last_message_at >= since24h);
+    const hadVC   = !!(row.last_vc_at && row.last_vc_at >= since24h);
 
-    const hadText = !!row.last_message_at && row.last_message_at >= since24h;
-    const hadVC   = !!row.last_vc_at     && row.last_vc_at     >= since24h;
-
-    if (hadText) {
-      textSenders++;
-      union.add(m.id);
-    }
-    if (hadVC) {
-      vcJoins++;
-      union.add(m.id);
-    }
-
-    if (m.joinedTimestamp && m.joinedTimestamp >= since24h) {
-      newMembers++;
-    }
+    if (hadText) { textSenders++; union.add(m.id); }
+    if (hadVC)   { vcJoins++;     union.add(m.id); }
   }
 
-  const activeUsers = union.size; // union of text OR VC in last 24h
+  const activeUsers = union.size;
 
-  // rotate fun openers
-  const openers = [
-    "ahoy you sea dwelling studiers! Let's see how many people sailed the oceanside seas today",
-    "batten down the hatches—today’s study seas be choppy!",
-    "trim the sails, mates! here’s today’s voyage across the chat waters",
-    "anchors aweigh! daily headcount of our studious crew coming right up"
+  // new users joined in the last 24h (best-effort; if unavailable, shows 0)
+  let newUsers24h = 0;
+  try {
+    const joined = Array.from(members.values()).filter(m => {
+      const ts = m.joinedTimestamp ?? 0;
+      return ts >= since24h;
+    });
+    newUsers24h = joined.length;
+  } catch { newUsers24h = 0; }
+
+  const needsBoost = activeUsers < 15;
+
+  // Minimal, title-less embed: just fields (clean grid look)
+  const embed = new EmbedBuilder()
+    .addFields(
+      { name: 'Active users', value: String(activeUsers), inline: true },
+      { name: 'Text senders', value: String(textSenders), inline: true },
+      { name: 'VC joins', value: String(vcJoins), inline: true },
+      { name: 'New members', value: String(newUsers24h), inline: true },
+    )
+    .setTimestamp(new Date());
+
+  // rotate a few fun openers
+  const pirateOpeners = [
+    "ahoy you sea dwelling studiers! let's see how many people sailed the oceanside seas today 🏴‍☠️",
+    "ahoy crew! who charted the academic waters in the last day? 🌊",
+    "anchors aweigh! a roll call of today’s study sailors! ⚓️",
+    "yarrr! tallying the brave souls who braved the seas o’ study! 🏴",
   ];
-  const opener = openers[Math.floor(Math.random() * openers.length)];
+  const opener = pirateOpeners[Math.floor(Math.random() * pirateOpeners.length)];
 
-  // plain-text message (no embeds)
-  const message =
-    `${opener}\n` +
-    `Active users (24h): **${activeUsers}**\n` +
-    `Text senders: **${textSenders}** | VC joins: **${vcJoins}** | New members: **${newMembers}**`;
 
-  return { activeUsers, textSenders, vcJoins, newMembers, message };
+  // Plaintext message line (no header, no cutoff text)
+  const content = `${opener}\n${vibe}`;
+
+  return { content, embed };
 }
 
 async function postHealthSnapshot(guild, channel) {
-  const { message } = await buildHealthSnapshotForGuild(guild);
-  await channel.send({ content: message });
+  const { content, embed } = await buildHealthSnapshotForGuild(guild);
+  // HYBRID: send a normal message line + an embed with clean fields
+  await channel.send({ content, embeds: [embed] });
 }
 
 // ---- Events ----
