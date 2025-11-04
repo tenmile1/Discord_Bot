@@ -403,7 +403,11 @@ async function buildHealthSnapshotForGuild(guild) {
     }
     if (hadVC) {
       vcJoins++;
-      union.ad
+      union.add(m.id);
+    }
+}
+
+const activeUsers = union.size; // union of text OR VC
 
   // fun opener rotates daily
   const opener = pickDailyPirateOpener();
