@@ -853,7 +853,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// --- Scheduled: Daily 04:00 PT inactive report to mod-log AND health/chat channel ---
+// --- Scheduled: Daily 04:00 PT inactive report to mod-log ONLY (fallbacks to health/chat if unset) ---
 new cron.CronJob('0 4 * * *', async () => {
   for (const [, guild] of client.guilds.cache) {
     try {
@@ -871,11 +871,17 @@ new cron.CronJob('0 4 * * *', async () => {
         (DEFAULT_MIN_VC_MINUTES > 0 ? ` & < ${DEFAULT_MIN_VC_MINUTES} VC mins` : ``);
 
       const modCh = await getModLogChannel(guild);
-      const healthCh = await getHealthLogChannel(guild);
-
-      if (modCh) await modCh.send({ content: line });
-      if (healthCh && (!modCh || healthCh.id !== modCh.id)) await healthCh.send({ content: line });
-      if (!modCh && !healthCh) console.log(`[${guild.name}] ${line.replace(/\n/g, ' ')}`);
+      if (modCh) {
+        await modCh.send({ content: line });
+      } else {
+        // fallback only if no mod-log configured
+        const healthCh = await getHealthLogChannel(guild);
+        if (healthCh) {
+          await healthCh.send({ content: line });
+        } else {
+          console.log(`[${guild.name}] ${line.replace(/\n/g, ' ')}`);
+        }
+      }
     } catch (e) {
       console.warn(`[${guild.id}] daily inactive report failed:`, e.message);
     }
